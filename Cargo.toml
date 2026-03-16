@@ -6,6 +6,9 @@ rust-version = "1.85"
 description = "DOT-based AI pipeline runner"
 license = "MIT"
 repository = "https://github.com/bkrabach/attractor"
+readme = "README.md"
+keywords = ["pipeline", "workflow", "ai", "llm", "graph"]
+categories = ["development-tools", "asynchronous"]
 
 [dependencies]
 unified-llm       = { git = "https://github.com/bkrabach/unified-llm.git" }
@@ -22,9 +25,16 @@ tracing      = "0.1"
 tokio-util   = { version = "0.7" }
 nom          = "8"
 indexmap     = { version = "2",    features = ["serde"] }
+clap         = { version = "4",    features = ["derive"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+regex        = "1"
 
 [dev-dependencies]
 tokio    = { version = "1",  features = ["rt-multi-thread", "macros"] }
 anyhow   = "1"
 proptest = "1"
 tempfile = "3"
+
+[[bin]]
+name = "attractor"
+path = "src/main.rs"
