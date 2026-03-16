@@ -198,4 +198,42 @@ mod tests {
         let g = apply_transforms(g, &[]);
         assert_eq!(g.nodes["A"].prompt, "$goal"); // not expanded
     }
+
+    // --- GAP-ATR-002: class attribute + stylesheet merge pipeline ---
+
+    #[test]
+    fn class_attr_plus_stylesheet_merge_sets_llm_model() {
+        // GAP-ATR-002: parse DOT with class="fast" on a node AND
+        // model_stylesheet at graph level, apply StylesheetApplicationTransform,
+        // verify node's llm_model is set from the class rule.
+        use crate::parser::parse_dot;
+
+        let dot = r#"
+digraph {
+    graph [model_stylesheet=".fast { llm_model: turbo-model; }"]
+    start [shape=Mdiamond]
+    exit  [shape=Msquare]
+    task  [class="fast", prompt="do the work"]
+    start -> task -> exit
+}
+"#;
+        let graph = parse_dot(dot).expect("DOT should parse");
+        // Verify class was parsed correctly
+        assert_eq!(graph.nodes["task"].class, "fast");
+        assert_eq!(
+            graph.graph_attrs.model_stylesheet,
+            ".fast { llm_model: turbo-model; }"
+        );
+
+        // Apply the stylesheet transform
+        let transformed = StylesheetApplicationTransform.apply(graph);
+
+        // Verify the llm_model was set by the class rule
+        assert_eq!(
+            transformed.nodes["task"].llm_model, "turbo-model",
+            "stylesheet class rule should set llm_model on matching node"
+        );
+        // Non-matching nodes should not have llm_model set
+        assert_eq!(transformed.nodes["start"].llm_model, "");
+    }
 }

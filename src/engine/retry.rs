@@ -211,13 +211,37 @@ pub async fn execute_with_retry(
                 return out;
             }
             StageStatus::Fail => {
+                // V2-ATR-002: FAIL must be retried just like RETRY (NLSpec §3.4).
+                if attempt < max {
+                    let count = node_retries.entry(node.id.clone()).or_insert(0);
+                    *count += 1;
+                    let delay = policy.backoff.delay_for_attempt(attempt);
+                    let _ = event_tx.send(PipelineEvent::StageRetrying {
+                        name: node.id.clone(),
+                        index: attempt as usize,
+                        attempt,
+                        delay,
+                    });
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+                // Retries exhausted.
+                if node.allow_partial {
+                    return Outcome {
+                        status: StageStatus::PartialSuccess,
+                        notes: "retries exhausted, partial accepted".to_string(),
+                        failure_reason: outcome.failure_reason,
+                        ..Default::default()
+                    };
+                }
+                let out = Outcome::fail(outcome.failure_reason.clone());
                 let _ = event_tx.send(PipelineEvent::StageFailed {
                     name: node.id.clone(),
                     index: attempt as usize,
-                    error: outcome.failure_reason.clone(),
+                    error: outcome.failure_reason,
                     will_retry: false,
                 });
-                return outcome;
+                return out;
             }
         }
     }
@@ -292,6 +316,33 @@ mod tests {
         };
         assert_eq!(cfg.delay_for_attempt(1).as_millis(), 500);
         assert_eq!(cfg.delay_for_attempt(3).as_millis(), 500);
+    }
+
+    // --- GAP-ATR-008: jitter produces varying delays ---
+
+    #[test]
+    fn delay_with_jitter_varies_across_calls() {
+        // GAP-ATR-008: NLSpec §11.5 — "Jitter is applied to backoff delays
+        // when configured".  With jitter=true, the random component should cause
+        // delay_for_attempt to return different values across multiple calls.
+        // Statistical test: run 20 times; at least two results must differ.
+        let cfg = BackoffConfig {
+            initial_delay_ms: 1_000,
+            backoff_factor: 1.0,
+            max_delay_ms: 60_000,
+            jitter: true,
+        };
+
+        let delays: Vec<u128> = (0..20)
+            .map(|_| cfg.delay_for_attempt(1).as_millis())
+            .collect();
+
+        let first = delays[0];
+        assert!(
+            delays.iter().any(|&d| d != first),
+            "jitter=true should produce varying delays across 20 calls; all were {first} ms. \
+             delays: {delays:?}"
+        );
     }
 
     // --- RetryPolicy::from_node ---
@@ -424,9 +475,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fail_returns_immediately() {
+    async fn fail_exhausts_retries_like_retry() {
+        // V2-ATR-002: StageStatus::Fail must be retried like Retry.
+        // With policy max_attempts=3 and handler always returning Fail,
+        // the handler must be called 3 times before returning a final Fail.
         let (tx, _rx) = tokio::sync::broadcast::channel(16);
-        let handler = SequenceHandler::new(vec![Outcome::fail("bad")]);
+        let handler = SequenceHandler::new(vec![
+            Outcome::fail("bad"),
+            Outcome::fail("still bad"),
+            Outcome::fail("really bad"),
+        ]);
         let ctx = Context::new();
         let g = make_graph(0);
         let node = make_node_simple();
@@ -444,7 +502,44 @@ mod tests {
         )
         .await;
         assert_eq!(out.status, StageStatus::Fail);
-        assert_eq!(handler.call_count(), 1);
+        assert_eq!(
+            handler.call_count(),
+            3,
+            "Fail must be retried; expected 3 calls"
+        );
+    }
+
+    #[tokio::test]
+    async fn fail_triggers_retry_then_success() {
+        // V2-ATR-002: Fail on first call → retry → Success on second call.
+        // With max_attempts=2, pipeline succeeds (not fails immediately).
+        let (tx, _rx) = tokio::sync::broadcast::channel(16);
+        let handler = SequenceHandler::new(vec![
+            Outcome::fail("first attempt failed"),
+            Outcome::success(),
+        ]);
+        let ctx = Context::new();
+        let g = make_graph(0);
+        let node = make_node_simple();
+        let policy = no_jitter_policy(2); // 1 retry allowed
+        let mut retries = HashMap::new();
+        let out = execute_with_retry(
+            &handler,
+            &node,
+            &ctx,
+            &g,
+            std::path::Path::new("/tmp"),
+            &policy,
+            &mut retries,
+            &tx,
+        )
+        .await;
+        assert_eq!(
+            out.status,
+            StageStatus::Success,
+            "Fail then Success with max_attempts=2 must succeed"
+        );
+        assert_eq!(handler.call_count(), 2, "Handler must be called twice");
     }
 
     #[tokio::test]

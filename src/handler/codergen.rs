@@ -96,7 +96,14 @@ impl Handler for CodergenHandler {
         if let Some(backend) = &self.backend {
             match backend.run(node, &prompt, context).await {
                 Ok(CodergenResult::Outcome(outcome)) => {
-                    // Backend returned a full outcome — write status and return.
+                    // Backend returned a full outcome.
+                    // NLSpec §11.6: response.md must be written unconditionally.
+                    let response_content = if !outcome.notes.is_empty() {
+                        outcome.notes.clone()
+                    } else {
+                        format!("[Outcome] status={}", outcome.status)
+                    };
+                    fs::write(stage_dir.join("response.md"), &response_content).await?;
                     write_status(&stage_dir, &outcome).await?;
                     return Ok(outcome);
                 }
@@ -335,7 +342,8 @@ mod tests {
             .unwrap();
         let text = std::fs::read_to_string(dir.path().join("step").join("status.json")).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(parsed["status"], "success");
+        // NLSpec Appendix C: field is named "outcome", not "status"
+        assert_eq!(parsed["outcome"], "success");
     }
 
     #[tokio::test]
@@ -355,6 +363,38 @@ mod tests {
         assert_eq!(
             outcome.context_updates.get("last_response"),
             Some(&Value::Str("text response".to_string()))
+        );
+    }
+
+    #[tokio::test]
+    async fn response_md_written_for_outcome_variant() {
+        // NLSpec §11.6: response.md must be written unconditionally, including
+        // when the backend returns CodergenResult::Outcome directly.
+        let dir = tempfile::tempdir().unwrap();
+        let expected = Outcome {
+            notes: "outcome notes text".to_string(),
+            ..Outcome::success()
+        };
+        let backend = MockOutcomeBackend {
+            outcome: expected.clone(),
+        };
+        let handler = CodergenHandler::new(Some(Box::new(backend)));
+        let node = make_node("n", "p");
+        let ctx = Context::new();
+        let graph = make_graph("g");
+        handler
+            .execute(&node, &ctx, &graph, dir.path())
+            .await
+            .unwrap();
+        let path = dir.path().join("n").join("response.md");
+        assert!(
+            path.exists(),
+            "response.md must exist when backend returns Outcome"
+        );
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !content.is_empty(),
+            "response.md must not be empty when backend returns Outcome"
         );
     }
 

@@ -63,9 +63,15 @@ impl std::fmt::Display for StageStatus {
 /// The execution engine reads `status` for retry/fail routing, applies
 /// `context_updates` to the shared context, and uses `preferred_label` /
 /// `suggested_next_ids` during edge selection.
+///
+/// NLSpec Appendix C: the `status` field serialises as `"outcome"` in
+/// `status.json` to match the external file-contract field name.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Outcome {
     /// Terminal status of the node execution.
+    ///
+    /// Serialised as `"outcome"` in JSON per NLSpec Appendix C.
+    #[serde(rename = "outcome")]
     pub status: StageStatus,
     /// Preferred edge label to follow (empty → engine uses other criteria).
     pub preferred_label: String,
@@ -353,6 +359,23 @@ mod tests {
     #[test]
     fn stage_status_display() {
         assert_eq!(StageStatus::Retry.to_string(), "retry");
+    }
+
+    #[test]
+    fn outcome_status_field_serializes_as_outcome() {
+        // NLSpec Appendix C: status.json field must be named "outcome", not "status".
+        let o = Outcome::success();
+        let json = serde_json::to_string(&o).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(
+            !parsed["outcome"].is_null(),
+            "status.json must contain field \"outcome\", got: {json}"
+        );
+        assert!(
+            parsed["status"].is_null(),
+            "status.json must NOT contain field \"status\", got: {json}"
+        );
+        assert_eq!(parsed["outcome"], "success");
     }
 
     #[test]

@@ -20,20 +20,22 @@ use std::time::Duration;
 // ---------------------------------------------------------------------------
 
 /// The kind of question being asked.
+///
+/// Variant names match NLSpec §11.8: SINGLE_SELECT, MULTI_SELECT, FREE_TEXT, CONFIRM.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum QuestionType {
-    /// Binary yes/no question.
-    YesNo,
-    /// Select one option from a list.
-    MultipleChoice,
+    /// Select a single option (binary yes/no or from a list).
+    SingleSelect,
+    /// Select one or more options from a list.
+    MultiSelect,
     /// Free text input.
-    Freeform,
-    /// Yes/no confirmation (semantically distinct from `YesNo`).
+    FreeText,
+    /// Yes/no confirmation prompt.
     Confirmation,
 }
 
-/// One selectable option in a [`QuestionType::MultipleChoice`] question.
+/// One selectable option in a [`QuestionType::MultiSelect`] question.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuestionOption {
     /// Accelerator key (e.g. `"Y"`, `"A"`, `"1"`).
@@ -49,7 +51,7 @@ pub struct Question {
     pub text: String,
     /// The kind of input expected.
     pub question_type: QuestionType,
-    /// Options for [`QuestionType::MultipleChoice`] questions.
+    /// Options for [`QuestionType::MultiSelect`] questions.
     pub options: Vec<QuestionOption>,
     /// Default answer if no response is received within `timeout`.
     pub default: Option<Answer>,
@@ -86,7 +88,7 @@ pub enum AnswerValue {
 pub struct Answer {
     /// The abstract answer value.
     pub value: AnswerValue,
-    /// The full selected option (populated for [`QuestionType::MultipleChoice`]).
+    /// The full selected option (populated for [`QuestionType::MultiSelect`]).
     pub selected_option: Option<QuestionOption>,
     /// Free-text representation of the answer.
     pub text: String,
@@ -178,8 +180,19 @@ pub struct AutoApproveInterviewer;
 impl Interviewer for AutoApproveInterviewer {
     async fn ask(&self, question: Question) -> Answer {
         match question.question_type {
-            QuestionType::YesNo | QuestionType::Confirmation => Answer::yes(),
-            QuestionType::MultipleChoice => {
+            // V2-ATR-006: For SingleSelect with options, return the first option
+            // (not a generic "yes"). This matches what an automated approver
+            // should do — pick the first (typically the affirmative) option.
+            QuestionType::SingleSelect => {
+                if let Some(first) = question.options.into_iter().next() {
+                    Answer::selected(first)
+                } else {
+                    // No options → binary yes/no prompt.
+                    Answer::yes()
+                }
+            }
+            QuestionType::Confirmation => Answer::yes(),
+            QuestionType::MultiSelect => {
                 if let Some(first) = question.options.into_iter().next() {
                     Answer::selected(first)
                 } else {
@@ -190,7 +203,7 @@ impl Interviewer for AutoApproveInterviewer {
                     }
                 }
             }
-            QuestionType::Freeform => Answer {
+            QuestionType::FreeText => Answer {
                 value: AnswerValue::Selected("auto-approved".to_string()),
                 selected_option: None,
                 text: "auto-approved".to_string(),
@@ -357,6 +370,105 @@ impl<I: Interviewer + Send + Sync> Interviewer for RecordingInterviewer<I> {
 }
 
 // ---------------------------------------------------------------------------
+// ConsoleInterviewer
+// ---------------------------------------------------------------------------
+
+/// Reads questions from and writes answers to the terminal (stdin/stdout).
+///
+/// Suitable for interactive CLI use.  For CI/CD environments prefer
+/// [`AutoApproveInterviewer`]; for deterministic testing prefer
+/// [`QueueInterviewer`].
+///
+/// ## Behaviour
+///
+/// | Question type | Output | Input parsing |
+/// |---|---|---|
+/// | `SingleSelect` / `MultiSelect` | Prints numbered list | Parses `1` … `N`, then key match, then label match |
+/// | `FreeText` | Prints question text | Returns raw trimmed line |
+/// | `Confirmation` | Prints `[y/n]` prompt | `y`/`yes` → Yes, anything else → No |
+pub struct ConsoleInterviewer;
+
+#[async_trait]
+impl Interviewer for ConsoleInterviewer {
+    async fn ask(&self, question: Question) -> Answer {
+        use tokio::io::AsyncBufReadExt as _;
+
+        // Print the question text.
+        println!("{}", question.text);
+
+        // Print options for select questions.
+        match question.question_type {
+            QuestionType::SingleSelect | QuestionType::MultiSelect => {
+                for (i, opt) in question.options.iter().enumerate() {
+                    println!("  {}. {}", i + 1, opt.label);
+                }
+            }
+            QuestionType::Confirmation => {
+                print!("[y/n]: ");
+            }
+            QuestionType::FreeText => {}
+        }
+
+        // Read a line from stdin.
+        let stdin = tokio::io::stdin();
+        let mut reader = tokio::io::BufReader::new(stdin);
+        let mut line = String::new();
+        let _ = reader.read_line(&mut line).await;
+        let input = line.trim().to_string();
+
+        // Parse response based on question type.
+        match question.question_type {
+            QuestionType::SingleSelect | QuestionType::MultiSelect => {
+                // Try numeric index first (1-based).
+                if let Ok(n) = input.parse::<usize>() {
+                    if n >= 1 && n <= question.options.len() {
+                        return Answer::selected(question.options[n - 1].clone());
+                    }
+                }
+                // Try key match (case-insensitive).
+                if let Some(opt) = question
+                    .options
+                    .iter()
+                    .find(|o| o.key.eq_ignore_ascii_case(&input))
+                {
+                    return Answer::selected(opt.clone());
+                }
+                // Try label match (case-insensitive).
+                if let Some(opt) = question
+                    .options
+                    .iter()
+                    .find(|o| o.label.eq_ignore_ascii_case(&input))
+                {
+                    return Answer::selected(opt.clone());
+                }
+                // Fall back to first option, or yes if no options.
+                if let Some(first) = question.options.first() {
+                    Answer::selected(first.clone())
+                } else {
+                    Answer::yes()
+                }
+            }
+            QuestionType::FreeText => Answer {
+                value: AnswerValue::Selected(input.clone()),
+                selected_option: None,
+                text: input,
+            },
+            QuestionType::Confirmation => {
+                if input.to_ascii_lowercase().starts_with('y') {
+                    Answer::yes()
+                } else {
+                    Answer::no()
+                }
+            }
+        }
+    }
+
+    async fn inform(&self, message: &str, _stage: &str) {
+        println!("{message}");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -367,7 +479,7 @@ mod tests {
     fn make_mc_question(options: Vec<(&str, &str)>) -> Question {
         Question {
             text: "Choose".to_string(),
-            question_type: QuestionType::MultipleChoice,
+            question_type: QuestionType::MultiSelect,
             options: options
                 .into_iter()
                 .map(|(k, l)| QuestionOption {
@@ -385,7 +497,7 @@ mod tests {
     fn make_yesno_question() -> Question {
         Question {
             text: "Proceed?".to_string(),
-            question_type: QuestionType::YesNo,
+            question_type: QuestionType::SingleSelect,
             options: vec![],
             default: None,
             timeout: None,
@@ -451,6 +563,47 @@ mod tests {
         assert_eq!(a.value, AnswerValue::Yes);
     }
 
+    // V2-ATR-006: AutoApproveInterviewer returns first option text for
+    // SingleSelect with options, NOT generic "yes".
+    #[tokio::test]
+    async fn auto_approve_single_select_with_options_returns_first_option() {
+        let iv = AutoApproveInterviewer;
+        let q = Question {
+            text: "Choose action".to_string(),
+            question_type: QuestionType::SingleSelect,
+            options: vec![
+                QuestionOption {
+                    key: "A".to_string(),
+                    label: "Approve".to_string(),
+                },
+                QuestionOption {
+                    key: "R".to_string(),
+                    label: "Reject".to_string(),
+                },
+            ],
+            default: None,
+            timeout: None,
+            stage: "test".to_string(),
+            metadata: HashMap::new(),
+        };
+        let a = iv.ask(q).await;
+        // Must return the FIRST option (Approve), NOT a generic "yes".
+        assert_eq!(
+            a.value,
+            AnswerValue::Selected("A".to_string()),
+            "AutoApproveInterviewer must return first option key for SingleSelect with options"
+        );
+        assert_eq!(a.text, "Approve");
+    }
+
+    // SingleSelect with NO options still returns yes (backward-compatible).
+    #[tokio::test]
+    async fn auto_approve_single_select_no_options_returns_yes() {
+        let iv = AutoApproveInterviewer;
+        let a = iv.ask(make_yesno_question()).await;
+        assert_eq!(a.value, AnswerValue::Yes);
+    }
+
     #[tokio::test]
     async fn auto_approve_confirmation() {
         let iv = AutoApproveInterviewer;
@@ -483,11 +636,41 @@ mod tests {
     async fn auto_approve_freeform() {
         let iv = AutoApproveInterviewer;
         let q = Question {
-            question_type: QuestionType::Freeform,
+            question_type: QuestionType::FreeText,
             ..make_yesno_question()
         };
         let a = iv.ask(q).await;
         assert_eq!(a.value, AnswerValue::Selected("auto-approved".to_string()));
+    }
+
+    // -- GAP-ATR-013: QuestionType enum variants match NLSpec §11.8 ---
+
+    #[test]
+    fn question_type_variant_names_match_nlspec() {
+        // GAP-ATR-013: NLSpec §11.8 specifies SINGLE_SELECT, MULTI_SELECT,
+        // FREE_TEXT, CONFIRM.  Verify the enum has the correctly-named variants.
+        let single = QuestionType::SingleSelect;
+        let multi = QuestionType::MultiSelect;
+        let free = QuestionType::FreeText;
+        let confirm = QuestionType::Confirmation;
+
+        // Serde roundtrip using snake_case serialisation
+        let s = serde_json::to_string(&single).unwrap();
+        assert_eq!(s, r#""single_select""#);
+
+        let s = serde_json::to_string(&multi).unwrap();
+        assert_eq!(s, r#""multi_select""#);
+
+        let s = serde_json::to_string(&free).unwrap();
+        assert_eq!(s, r#""free_text""#);
+
+        let s = serde_json::to_string(&confirm).unwrap();
+        assert_eq!(s, r#""confirmation""#);
+
+        // All four variants must be distinct
+        assert_ne!(QuestionType::SingleSelect, QuestionType::MultiSelect);
+        assert_ne!(QuestionType::SingleSelect, QuestionType::FreeText);
+        assert_ne!(QuestionType::SingleSelect, QuestionType::Confirmation);
     }
 
     #[tokio::test]

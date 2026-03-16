@@ -49,15 +49,21 @@ pub enum Selector {
     Class(String),
     /// `#node_id` — matches a specific node by ID.
     Id(String),
+    /// `shape-name` — bare identifier, matches nodes whose `shape` attribute equals the name.
+    /// E.g. `box { ... }` applies to every node with `shape=box`.
+    Shape(String),
 }
 
 impl Selector {
-    /// Specificity score: Universal=0, Class=1, Id=2.
+    /// Specificity score following NLSpec §8: Universal=0, Shape=1, Class=2, Id=3.
+    ///
+    /// Higher specificity wins. Rules of equal specificity: last declared wins.
     pub fn specificity(&self) -> u8 {
         match self {
             Selector::Universal => 0,
-            Selector::Class(_) => 1,
-            Selector::Id(_) => 2,
+            Selector::Shape(_) => 1,
+            Selector::Class(_) => 2,
+            Selector::Id(_) => 3,
         }
     }
 }
@@ -179,6 +185,16 @@ fn parse_selector(chars: &[char], pos: &mut usize, _src: &str) -> Result<Selecto
                 return Err("empty class selector".to_string());
             }
             Ok(Selector::Class(cls))
+        }
+        // Bare identifier → shape-name selector (NLSpec §11.10)
+        c if c.is_ascii_alphabetic() || c == '_' => {
+            let shape = collect_while(chars, pos, |c| {
+                c.is_ascii_alphanumeric() || c == '_' || c == '-'
+            });
+            if shape.is_empty() {
+                return Err("empty shape selector".to_string());
+            }
+            Ok(Selector::Shape(shape))
         }
         c => Err(format!("unexpected character {c:?} in selector")),
     }
@@ -396,6 +412,7 @@ fn rule_matches_node(rule: &StyleRule, node: &crate::graph::Node) -> bool {
             // class is comma-separated list
             node.class.split(',').any(|c| c.trim() == cls.as_str())
         }
+        Selector::Shape(shape) => &node.shape == shape,
     }
 }
 
@@ -552,8 +569,78 @@ mod tests {
 
     #[test]
     fn specificity_values() {
+        // V2-ATR-004: NLSpec §8 specificity order: universal < shape < class < ID
         assert_eq!(Selector::Universal.specificity(), 0);
-        assert_eq!(Selector::Class("c".into()).specificity(), 1);
-        assert_eq!(Selector::Id("i".into()).specificity(), 2);
+        assert_eq!(Selector::Shape("box".into()).specificity(), 1);
+        assert_eq!(Selector::Class("c".into()).specificity(), 2);
+        assert_eq!(Selector::Id("i".into()).specificity(), 3);
+    }
+
+    #[test]
+    fn class_wins_over_shape() {
+        // V2-ATR-004: A class rule must override a shape rule for a node that
+        // matches both, because class (specificity=2) > shape (specificity=1).
+        // The class rule is listed FIRST — it only wins if specificity
+        // differentiates. If both had equal specificity, the shape rule (listed
+        // second, higher index) would win by last-write-wins.
+        let src = r#"
+            .fast { llm_model: class-model; }
+            box { llm_model: shape-model; }
+        "#;
+        let ss = parse_stylesheet(src).unwrap();
+        let mut g = make_graph_with_nodes(vec![("task", "box", "fast")]);
+        apply_stylesheet(&ss, &mut g);
+        assert_eq!(
+            g.nodes["task"].llm_model, "class-model",
+            "class rule (specificity=2) must win over shape rule (specificity=1) \
+             even when shape rule is listed later"
+        );
+    }
+
+    // --- GAP-ATR-015: shape-name selector ---
+
+    #[test]
+    fn parse_shape_selector() {
+        // GAP-ATR-015: a bare identifier in the stylesheet should be parsed as a
+        // Shape selector, e.g. `box { llm_model: test-model; }`.
+        let ss = parse_stylesheet("box { llm_model: test-model; }").unwrap();
+        assert_eq!(ss.rules.len(), 1);
+        assert_eq!(ss.rules[0].selector, Selector::Shape("box".to_string()));
+        assert_eq!(
+            ss.rules[0].declarations[0].property,
+            StyleProperty::LlmModel
+        );
+        assert_eq!(ss.rules[0].declarations[0].value, "test-model");
+    }
+
+    #[test]
+    fn apply_shape_rule_matches_nodes_with_matching_shape() {
+        // GAP-ATR-015: a `box { ... }` rule should apply to nodes with shape=box
+        // and NOT to nodes with a different shape.
+        let mut g = make_graph_with_nodes(vec![
+            ("task_a", "box", ""),
+            ("task_b", "diamond", ""),
+            ("task_c", "box", ""),
+        ]);
+        let ss = parse_stylesheet("box { llm_model: turbo; }").unwrap();
+        apply_stylesheet(&ss, &mut g);
+
+        // Nodes with shape=box get the model
+        assert_eq!(g.nodes["task_a"].llm_model, "turbo");
+        assert_eq!(g.nodes["task_c"].llm_model, "turbo");
+        // Node with a different shape is unchanged
+        assert_eq!(g.nodes["task_b"].llm_model, "");
+    }
+
+    #[test]
+    fn shape_rule_overridden_by_id_rule() {
+        // Shape (specificity=1) must be overridden by an ID rule (specificity=2).
+        let mut g = make_graph_with_nodes(vec![("special", "box", "")]);
+        let ss = parse_stylesheet(
+            "box { llm_model: generic-model; } #special { llm_model: specific-model; }",
+        )
+        .unwrap();
+        apply_stylesheet(&ss, &mut g);
+        assert_eq!(g.nodes["special"].llm_model, "specific-model");
     }
 }

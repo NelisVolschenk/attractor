@@ -74,6 +74,15 @@ pub struct HandlerRegistry {
     default_handler: Arc<dyn Handler>,
 }
 
+impl Clone for HandlerRegistry {
+    fn clone(&self) -> Self {
+        HandlerRegistry {
+            handlers: self.handlers.clone(),
+            default_handler: self.default_handler.clone(),
+        }
+    }
+}
+
 impl HandlerRegistry {
     /// Create a registry with the given default handler.
     pub fn new(default_handler: Arc<dyn Handler>) -> Self {

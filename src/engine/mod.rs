@@ -21,8 +21,8 @@ use crate::error::EngineError;
 use crate::events::{EVENT_CHANNEL_CAPACITY, PipelineEvent};
 use crate::graph::{Graph, Value};
 use crate::handler::{
-    CodergenHandler, ConditionalHandler, ExitHandler, Handler, HandlerRegistry, StartHandler,
-    ToolHandler, WaitForHumanHandler,
+    CodergenHandler, ConditionalHandler, ExitHandler, FanInHandler, Handler, HandlerRegistry,
+    ParallelHandler, StartHandler, ToolHandler, WaitForHumanHandler,
 };
 use crate::interviewer::{AutoApproveInterviewer, Interviewer};
 use crate::parser::parse_dot;
@@ -153,10 +153,17 @@ impl PipelineRunner {
         let completed_nodes = cp.completed_nodes.clone();
         let node_retries = cp.node_retries.clone();
 
-        // Build synthetic outcomes for completed nodes (assume success for goal gate purposes).
+        // Restore actual node outcomes from checkpoint (V2-ATR-005).
+        // Fall back to Outcome::success() only for nodes not recorded in the
+        // checkpoint (e.g., checkpoints saved before this field was added).
         let mut node_outcomes: HashMap<String, Outcome> = HashMap::new();
         for node_id in &completed_nodes {
-            node_outcomes.insert(node_id.clone(), Outcome::success());
+            let outcome = cp
+                .node_outcomes
+                .get(node_id)
+                .cloned()
+                .unwrap_or_else(Outcome::success);
+            node_outcomes.insert(node_id.clone(), outcome);
         }
 
         // Determine next node: find edge from the last completed node.
@@ -272,6 +279,10 @@ impl PipelineRunner {
                     .await
                     .unwrap_or_else(|e| Outcome::fail(e.to_string()));
 
+                // GAP-ATR-006/009: Engine ensures status.json is written for ALL nodes.
+                let _ = write_node_status_json(&config.logs_root, &current_node_id, &exit_outcome)
+                    .await;
+
                 completed_nodes.push(current_node_id.clone());
                 node_outcomes.insert(current_node_id.clone(), exit_outcome.clone());
                 last_outcome = exit_outcome;
@@ -334,6 +345,9 @@ impl PipelineRunner {
 
             last_outcome = outcome.clone();
 
+            // GAP-ATR-006/009: Engine ensures status.json is written for ALL nodes.
+            let _ = write_node_status_json(&config.logs_root, &current_node_id, &outcome).await;
+
             // ----------------------------------------------------------------
             // Step 3: Record completion
             // ----------------------------------------------------------------
@@ -361,7 +375,13 @@ impl PipelineRunner {
             // ----------------------------------------------------------------
             // Step 5: Save checkpoint
             // ----------------------------------------------------------------
-            let cp = build_checkpoint(&context, &current_node_id, &completed_nodes, &node_retries);
+            let cp = build_checkpoint(
+                &context,
+                &current_node_id,
+                &completed_nodes,
+                &node_retries,
+                &node_outcomes,
+            );
             let cp_path = Checkpoint::default_path(&config.logs_root);
             cp.save(&cp_path)?;
             let _ = self.event_tx.send(PipelineEvent::CheckpointSaved {
@@ -505,10 +525,28 @@ impl PipelineRunnerBuilder {
     }
 
     /// Build the runner and return an event receiver.
+    ///
+    /// Registers `ParallelHandler` and `FanInHandler` automatically.
+    /// `ParallelHandler` receives a clone of the registry (without parallel
+    /// itself, since nested parallelism is not supported) so it can execute
+    /// branch nodes.
     pub fn build(self) -> (PipelineRunner, broadcast::Receiver<PipelineEvent>) {
         let (tx, rx) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+
+        // Clone the registry for use inside ParallelHandler (branch execution).
+        // This snapshot does NOT include the ParallelHandler itself — nested
+        // parallel is not supported and branch nodes are expected to be leaf
+        // handler types (codergen, tool, wait.human, …).
+        let branch_registry = Arc::new(self.registry.clone());
+        let parallel_handler = Arc::new(ParallelHandler::new(branch_registry, tx.clone()));
+        let fan_in_handler = Arc::new(FanInHandler::new());
+
+        let mut registry = self.registry;
+        registry.register("parallel", parallel_handler);
+        registry.register("parallel.fan_in", fan_in_handler);
+
         let runner = PipelineRunner {
-            registry: Arc::new(self.registry),
+            registry: Arc::new(registry),
             transforms: self.transforms,
             event_tx: tx,
         };
@@ -523,6 +561,31 @@ impl Default for PipelineRunnerBuilder {
 }
 
 // ---------------------------------------------------------------------------
+// Helper: write_node_status_json
+// ---------------------------------------------------------------------------
+
+/// Write `{logs_root}/{node_id}/status.json` for every executed node.
+///
+/// Handlers such as `CodergenHandler` write their own `status.json`; calling
+/// this afterwards is idempotent — the engine's outcome is the same value.
+/// For handlers that don't write the file (e.g. `StartHandler`, `ExitHandler`)
+/// this is the only write that occurs, satisfying NLSpec §11.3 / §11.6.
+async fn write_node_status_json(
+    logs_root: &Path,
+    node_id: &str,
+    outcome: &Outcome,
+) -> Result<(), EngineError> {
+    let stage_dir = logs_root.join(node_id);
+    tokio::fs::create_dir_all(&stage_dir).await?;
+    let json = serde_json::to_string_pretty(outcome).map_err(|e| EngineError::Handler {
+        node_id: node_id.to_string(),
+        message: format!("failed to serialise outcome: {e}"),
+    })?;
+    tokio::fs::write(stage_dir.join("status.json"), json).await?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Helper: build_checkpoint
 // ---------------------------------------------------------------------------
 
@@ -531,6 +594,7 @@ fn build_checkpoint(
     current_node: &str,
     completed: &[String],
     retries: &HashMap<String, u32>,
+    outcomes: &HashMap<String, Outcome>,
 ) -> Checkpoint {
     Checkpoint {
         timestamp: Utc::now(),
@@ -539,6 +603,7 @@ fn build_checkpoint(
         node_retries: retries.clone(),
         context_values: context.snapshot(),
         logs: context.logs_snapshot(),
+        node_outcomes: outcomes.clone(),
     }
 }
 
@@ -705,9 +770,13 @@ digraph test {
     #[tokio::test]
     async fn conditional_branching_fail_path() {
         let dir = tempfile::tempdir().unwrap();
+        // default_max_retry=0: run_tests has no retry budget so a Fail outcome
+        // flows immediately to edge selection (routing to the fail edge).
+        // Without default_max_retry=0, V2-ATR-002 would retry run_tests and the
+        // mock's default Success would route to pass_path instead.
         let dot = r#"
 digraph test {
-    graph [goal="branch test"]
+    graph [goal="branch test", default_max_retry=0]
     start [shape=Mdiamond]
     exit  [shape=Msquare]
     run_tests [prompt="run tests"]
@@ -783,6 +852,42 @@ digraph test {
         let (runner, _rx) = make_runner(mock.clone());
         let result = runner.run(dot, RunConfig::new(dir.path())).await.unwrap();
         assert_eq!(result.status, StageStatus::Success);
+    }
+
+    // GAP-ATR-007: happy-path goal gate (all gates succeed, pipeline exits cleanly)
+
+    #[tokio::test]
+    async fn goal_gate_all_succeed_exits_cleanly() {
+        // GAP-ATR-007: NLSpec §11.4 — before allowing exit the engine checks all
+        // goal_gate nodes have status SUCCESS.  This test verifies the happy path:
+        // goal_gate node succeeds on the first try → pipeline exits without any
+        // retry_target being used.
+        let dir = tempfile::tempdir().unwrap();
+        let dot = r#"
+digraph test {
+    start    [shape=Mdiamond]
+    exit     [shape=Msquare]
+    critical [prompt="critical task", goal_gate=true]
+    start -> critical -> exit
+}
+"#;
+        let mock = Arc::new(MockCodergenBackend::new());
+        // critical succeeds immediately — no retry needed
+        mock.add_success("critical");
+        let (runner, _rx) = make_runner(mock.clone());
+        let result = runner.run(dot, RunConfig::new(dir.path())).await.unwrap();
+
+        assert_eq!(result.status, StageStatus::Success);
+        assert!(
+            result.completed_nodes.contains(&"critical".to_string()),
+            "critical (goal_gate) node must be in completed_nodes"
+        );
+        assert!(
+            result.completed_nodes.contains(&"exit".to_string()),
+            "pipeline must reach exit when all goal gates pass"
+        );
+        // Only one call to critical — no retry was needed
+        assert_eq!(mock.call_count("critical"), 1);
     }
 
     // ---------------------------------------------------------------------------
@@ -915,6 +1020,7 @@ digraph test {
             node_retries: HashMap::new(),
             context_values,
             logs: Vec::new(),
+            node_outcomes: HashMap::new(),
         };
         let cp_path = Checkpoint::default_path(dir.path());
         cp.save(&cp_path).unwrap();
@@ -932,6 +1038,83 @@ digraph test {
         assert_eq!(mock2.call_count("plan"), 0);
         // implement and review should run.
         assert!(mock2.call_count("implement") > 0 || mock2.call_count("review") > 0);
+    }
+
+    #[tokio::test]
+    async fn resume_restores_goal_gate_outcome_from_checkpoint() {
+        // V2-ATR-005: On resume, goal-gate node outcomes must be restored from the
+        // checkpoint rather than being synthesised as Outcome::success().
+        //
+        // Scenario:
+        //   Pipeline: start → critical [goal_gate=true] → middle → exit
+        //   Graph retry_target = "critical" (so gate failure re-runs critical)
+        //   Checkpoint state: critical completed with Fail outcome.
+        //
+        //   Without fix: resume synthesises Success for critical → goal gate passes
+        //                → pipeline exits; critical is NOT re-executed (call_count=0).
+        //   With fix:    resume restores Fail for critical → goal gate fires →
+        //                routes to retry_target ("critical") → critical re-runs once
+        //                (mock returns Success) → gate passes → exit (call_count=1).
+        let dir = tempfile::tempdir().unwrap();
+        let dot = r#"
+digraph test {
+    graph [goal="critical test", retry_target="critical"]
+    start    [shape=Mdiamond]
+    exit     [shape=Msquare]
+    critical [goal_gate=true, prompt="critical work"]
+    middle   [prompt="middle work"]
+    start -> critical -> middle -> exit
+}
+"#;
+
+        // Mock: critical returns Success when called (for the goal-gate retry).
+        let mock = Arc::new(MockCodergenBackend::new());
+        mock.add_success("critical");
+        let (runner, _rx) = make_runner(mock.clone());
+
+        // Create a checkpoint simulating: start + critical completed, critical had Fail.
+        let mut context_values = HashMap::new();
+        context_values.insert(
+            "graph.goal".to_string(),
+            Value::Str("critical test".to_string()),
+        );
+        context_values.insert("outcome".to_string(), Value::Str("success".to_string()));
+
+        let mut node_outcomes_map = HashMap::new();
+        node_outcomes_map.insert("start".to_string(), Outcome::success());
+        node_outcomes_map.insert(
+            "critical".to_string(),
+            Outcome::fail("first attempt failed"),
+        );
+
+        let cp = Checkpoint {
+            timestamp: Utc::now(),
+            current_node: "critical".to_string(),
+            completed_nodes: vec!["start".to_string(), "critical".to_string()],
+            node_retries: HashMap::new(),
+            context_values,
+            logs: Vec::new(),
+            node_outcomes: node_outcomes_map,
+        };
+        let cp_path = Checkpoint::default_path(dir.path());
+        tokio::fs::create_dir_all(dir.path()).await.unwrap();
+        cp.save(&cp_path).unwrap();
+
+        let result = runner
+            .resume(dot, RunConfig::new(dir.path()))
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, StageStatus::Success);
+        // V2-ATR-005: critical must be re-executed once because the Fail outcome
+        // restored from the checkpoint triggers the goal gate, routing to retry_target.
+        assert_eq!(
+            mock.call_count("critical"),
+            1,
+            "goal gate must fire on resume when critical had Fail outcome; \
+             critical should be called once, got {} calls",
+            mock.call_count("critical")
+        );
     }
 
     // ---------------------------------------------------------------------------
@@ -953,5 +1136,491 @@ digraph test {
                 "Missing node {n}"
             );
         }
+    }
+
+    // ---------------------------------------------------------------------------
+    // GAP-ATR-006 / GAP-ATR-009: status.json written for ALL nodes
+    // ---------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn all_nodes_write_status_json() {
+        // NLSpec §11.3/§11.6: outcome must be written to
+        // `{logs_root}/{node_id}/status.json` for EVERY executed node,
+        // including start (shape=Mdiamond) and exit (shape=Msquare).
+        let dir = tempfile::tempdir().unwrap();
+        let mock = Arc::new(MockCodergenBackend::new());
+        let (runner, _rx) = make_runner(mock.clone());
+        let dot = linear_dot("test", vec!["task"]);
+        runner.run(&dot, RunConfig::new(dir.path())).await.unwrap();
+
+        // start node must have status.json
+        let start_status = dir.path().join("start").join("status.json");
+        assert!(
+            start_status.exists(),
+            "start node (shape=Mdiamond) must write status.json"
+        );
+        let start_json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&start_status).unwrap()).unwrap();
+        assert_eq!(start_json["outcome"], "success");
+
+        // codergen task node must have status.json
+        let task_status = dir.path().join("task").join("status.json");
+        assert!(
+            task_status.exists(),
+            "task (codergen) node must write status.json"
+        );
+
+        // exit node must have status.json
+        let exit_status = dir.path().join("exit").join("status.json");
+        assert!(
+            exit_status.exists(),
+            "exit node (shape=Msquare) must write status.json"
+        );
+        let exit_json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&exit_status).unwrap()).unwrap();
+        assert_eq!(exit_json["outcome"], "success");
+    }
+
+    // ---------------------------------------------------------------------------
+    // GAP-ATR-010: Tool handler (shape=parallelogram) runs e2e through PipelineRunner
+    // ---------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn tool_node_runs_e2e() {
+        // NLSpec §11.6: tool handler executes configured tool/command.
+        // Verify shape=parallelogram node routes to ToolHandler and runs
+        // `echo hello` end-to-end through PipelineRunner.
+        let dir = tempfile::tempdir().unwrap();
+        let dot = r#"
+digraph test {
+    graph [goal="tool test"]
+    start [shape=Mdiamond]
+    exit  [shape=Msquare]
+    echo_task [shape=parallelogram, tool_command="echo hello"]
+    start -> echo_task -> exit
+}
+"#;
+        let (runner, _rx) = PipelineRunner::builder().build();
+        let result = runner.run(dot, RunConfig::new(dir.path())).await.unwrap();
+
+        assert_eq!(result.status, StageStatus::Success);
+        assert!(
+            result.completed_nodes.contains(&"echo_task".to_string()),
+            "tool node must be in completed_nodes"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // GAP-ATR-011: Completely new handler type registered and run e2e
+    // ---------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn new_handler_type_registered_and_run_e2e() {
+        // NLSpec §11.6: custom handlers can be registered by type string.
+        // Register a brand-new "my_custom_type" handler (not overriding any
+        // built-in) and verify it executes through PipelineRunner.run().
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CustomHandler {
+            call_count: Arc<AtomicUsize>,
+        }
+
+        #[async_trait::async_trait]
+        impl crate::handler::Handler for CustomHandler {
+            async fn execute(
+                &self,
+                _node: &crate::graph::Node,
+                _context: &crate::state::context::Context,
+                _graph: &crate::graph::Graph,
+                _logs_root: &std::path::Path,
+            ) -> Result<crate::state::context::Outcome, crate::error::EngineError> {
+                self.call_count.fetch_add(1, Ordering::SeqCst);
+                Ok(crate::state::context::Outcome::success())
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let handler = Arc::new(CustomHandler {
+            call_count: call_count.clone(),
+        });
+
+        let dot = r#"
+digraph test {
+    graph [goal="custom handler test"]
+    start       [shape=Mdiamond]
+    exit        [shape=Msquare]
+    custom_node [type="my_custom_type", label="run custom"]
+    start -> custom_node -> exit
+}
+"#;
+        let (runner, _rx) = PipelineRunner::builder()
+            .with_handler("my_custom_type", handler)
+            .build();
+        let result = runner.run(dot, RunConfig::new(dir.path())).await.unwrap();
+
+        assert_eq!(result.status, StageStatus::Success);
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            1,
+            "custom handler must be called once"
+        );
+        assert!(result.completed_nodes.contains(&"custom_node".to_string()));
+    }
+
+    // ---------------------------------------------------------------------------
+    // GAP-ATR-019: WaitForHuman presents outgoing edge labels as choices
+    // ---------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn wait_human_presents_edge_labels_as_choices_to_interviewer() {
+        // NLSpec §11.12: Wait.human presents choices derived from outgoing edge
+        // labels. Verify the question options presented to the interviewer match
+        // the three edge labels defined in the DOT.
+        use crate::interviewer::{Answer, Interviewer, QuestionOption};
+
+        let dir = tempfile::tempdir().unwrap();
+
+        let dot = r#"
+digraph test {
+    graph [goal="human gate test"]
+    start    [shape=Mdiamond]
+    exit     [shape=Msquare]
+    gate     [shape=hexagon, label="Which path?"]
+    path_a   [prompt="path a"]
+    path_b   [prompt="path b"]
+    path_c   [prompt="path c"]
+    start -> gate
+    gate -> path_a [label="approve"]
+    gate -> path_b [label="reject"]
+    gate -> path_c [label="defer"]
+    path_a -> exit
+    path_b -> exit
+    path_c -> exit
+}
+"#;
+        // Build a RecordingInterviewer so we can inspect which question was
+        // presented to the interviewer after the run.
+        let recording_iv_inner = crate::interviewer::RecordingInterviewer::new(
+            crate::interviewer::QueueInterviewer::new(vec![Answer::selected(QuestionOption {
+                key: "A".to_string(),
+                label: "approve".to_string(),
+            })]),
+        );
+        let recording_arc = Arc::new(recording_iv_inner);
+        let iv_ref = recording_arc.clone();
+
+        let (runner, _rx) = PipelineRunner::builder()
+            .with_interviewer(iv_ref as Arc<dyn Interviewer>)
+            .build();
+
+        runner.run(dot, RunConfig::new(dir.path())).await.unwrap();
+
+        let recordings = recording_arc.recordings();
+        assert_eq!(
+            recordings.len(),
+            1,
+            "interviewer must be asked exactly once"
+        );
+
+        let question_options: Vec<String> = recordings[0]
+            .question
+            .options
+            .iter()
+            .map(|o| o.label.clone())
+            .collect();
+
+        // All three edge labels must appear as options.
+        assert!(
+            question_options.contains(&"approve".to_string()),
+            "option 'approve' must be present, got: {question_options:?}"
+        );
+        assert!(
+            question_options.contains(&"reject".to_string()),
+            "option 'reject' must be present, got: {question_options:?}"
+        );
+        assert!(
+            question_options.contains(&"defer".to_string()),
+            "option 'defer' must be present, got: {question_options:?}"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // GAP-ATR-020: Parallel fan-out + fan-in e2e through PipelineRunner
+    // ---------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn parallel_fanout_fanin_e2e() {
+        // NLSpec §11.12: parallel fan-out (shape=component) and fan-in
+        // (shape=tripleoctagon) complete correctly in a full pipeline run.
+        let dir = tempfile::tempdir().unwrap();
+        let mock = Arc::new(MockCodergenBackend::new());
+        let (runner, _rx) = make_runner(mock.clone());
+
+        let dot = r#"
+digraph test {
+    graph [goal="parallel test"]
+    start       [shape=Mdiamond]
+    exit        [shape=Msquare]
+    fan_out     [shape=component]
+    branch_a    [prompt="branch a work"]
+    branch_b    [prompt="branch b work"]
+    branch_c    [prompt="branch c work"]
+    fan_in      [shape=tripleoctagon]
+    start -> fan_out
+    fan_out -> branch_a
+    fan_out -> branch_b
+    fan_out -> branch_c
+    branch_a -> fan_in
+    branch_b -> fan_in
+    branch_c -> fan_in
+    fan_in -> exit
+}
+"#;
+        let result = runner.run(dot, RunConfig::new(dir.path())).await.unwrap();
+
+        assert_eq!(result.status, StageStatus::Success);
+        assert!(result.completed_nodes.contains(&"fan_out".to_string()));
+        assert!(result.completed_nodes.contains(&"fan_in".to_string()));
+
+        // V2-ATR-008: ALL three branches must have been executed (AND, not OR).
+        assert!(
+            mock.call_count("branch_a") > 0,
+            "branch_a must be executed; completed_nodes={:?}",
+            result.completed_nodes
+        );
+        assert!(
+            mock.call_count("branch_b") > 0,
+            "branch_b must be executed; completed_nodes={:?}",
+            result.completed_nodes
+        );
+        assert!(
+            mock.call_count("branch_c") > 0,
+            "branch_c must be executed; completed_nodes={:?}",
+            result.completed_nodes
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // GAP-ATR-021: Custom handler type verified through PipelineRunner.run() e2e
+    // ---------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn custom_handler_type_runs_full_pipeline() {
+        // NLSpec §11.12: custom handler registration and execution works.
+        // Uses a different type string to distinguish from GAP-ATR-011.
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct VerifyHandler {
+            executed: Arc<AtomicBool>,
+        }
+
+        #[async_trait::async_trait]
+        impl crate::handler::Handler for VerifyHandler {
+            async fn execute(
+                &self,
+                _node: &crate::graph::Node,
+                _context: &crate::state::context::Context,
+                _graph: &crate::graph::Graph,
+                _logs_root: &std::path::Path,
+            ) -> Result<crate::state::context::Outcome, crate::error::EngineError> {
+                self.executed.store(true, Ordering::SeqCst);
+                Ok(crate::state::context::Outcome::success())
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let executed = Arc::new(AtomicBool::new(false));
+        let handler = Arc::new(VerifyHandler {
+            executed: executed.clone(),
+        });
+
+        let dot = r#"
+digraph test {
+    graph [goal="custom type e2e"]
+    start      [shape=Mdiamond]
+    exit       [shape=Msquare]
+    verify_node [type="verify_action", label="verify action"]
+    start -> verify_node -> exit
+}
+"#;
+        let (runner, _rx) = PipelineRunner::builder()
+            .with_handler("verify_action", handler)
+            .build();
+        let result = runner.run(dot, RunConfig::new(dir.path())).await.unwrap();
+
+        assert_eq!(result.status, StageStatus::Success);
+        assert!(
+            executed.load(Ordering::SeqCst),
+            "custom handler must have been executed"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // GAP-ATR-022: Stylesheet model override flows through to CodergenBackend
+    // ---------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn stylesheet_model_override_reaches_backend() {
+        // NLSpec §11.12: stylesheet applies model override to nodes by shape,
+        // and that override flows through to CodergenBackend.run() call.
+        use crate::graph::Node;
+        use crate::state::context::Context;
+        use std::sync::Mutex;
+
+        struct ModelCapturingBackend {
+            captured_model: Arc<Mutex<Option<String>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl crate::handler::CodergenBackend for ModelCapturingBackend {
+            async fn run(
+                &self,
+                node: &Node,
+                _prompt: &str,
+                _ctx: &Context,
+            ) -> Result<crate::handler::CodergenResult, crate::error::EngineError> {
+                *self.captured_model.lock().unwrap() = Some(node.llm_model.clone());
+                Ok(crate::handler::CodergenResult::Outcome(
+                    crate::state::context::Outcome::success(),
+                ))
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let captured_model = Arc::new(Mutex::new(None::<String>));
+        let backend = Arc::new(ModelCapturingBackend {
+            captured_model: captured_model.clone(),
+        });
+
+        let dot = r#"
+digraph test {
+    graph [
+        goal="stylesheet test",
+        model_stylesheet="box { llm_model: gpt-4o-mini; }"
+    ]
+    start [shape=Mdiamond]
+    exit  [shape=Msquare]
+    task  [prompt="do the work"]
+    start -> task -> exit
+}
+"#;
+
+        struct BackendProxy(Arc<ModelCapturingBackend>);
+
+        #[async_trait::async_trait]
+        impl crate::handler::CodergenBackend for BackendProxy {
+            async fn run(
+                &self,
+                node: &Node,
+                prompt: &str,
+                ctx: &Context,
+            ) -> Result<crate::handler::CodergenResult, crate::error::EngineError> {
+                self.0.run(node, prompt, ctx).await
+            }
+        }
+
+        let codergen = Arc::new(CodergenHandler::new(Some(Box::new(BackendProxy(backend)))));
+        let (runner, _rx) = PipelineRunner::builder()
+            .with_handler("codergen", codergen)
+            .build();
+
+        runner.run(dot, RunConfig::new(dir.path())).await.unwrap();
+
+        let model = captured_model.lock().unwrap().clone();
+        assert_eq!(
+            model.as_deref(),
+            Some("gpt-4o-mini"),
+            "stylesheet model override must reach CodergenBackend, got: {model:?}"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // GAP-ATR-023: Full integration smoke test (NLSpec §11.13)
+    // ---------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn full_smoke_test_goal_gate_checkpoint_artifacts() {
+        // NLSpec §11.13: multi-node pipeline with goal_gate=true,
+        // conditional branching, checkpoint verification, and all three
+        // artifact files (prompt.md, response.md, status.json) for each
+        // codergen node.
+        let dir = tempfile::tempdir().unwrap();
+        let mock = Arc::new(MockCodergenBackend::new());
+
+        // plan → implement → review with goal gate on review.
+        // review succeeds first time (goal gate satisfied → exit).
+        mock.add_success("plan");
+        mock.add_success("implement");
+        mock.add_success("review");
+
+        let dot = r#"
+digraph smoke_test {
+    graph [goal="build feature X"]
+    start     [shape=Mdiamond]
+    exit      [shape=Msquare]
+    plan      [prompt="Plan the work for: $goal"]
+    implement [prompt="Implement the plan"]
+    review    [prompt="Review the implementation", goal_gate=true]
+    start -> plan -> implement -> review -> exit
+}
+"#;
+        let (runner, _rx) = make_runner(mock.clone());
+        let result = runner.run(dot, RunConfig::new(dir.path())).await.unwrap();
+
+        // Pipeline must succeed.
+        assert_eq!(result.status, StageStatus::Success);
+
+        // All nodes must complete.
+        for node_id in &["start", "plan", "implement", "review", "exit"] {
+            assert!(
+                result.completed_nodes.contains(&node_id.to_string()),
+                "node '{node_id}' must be in completed_nodes"
+            );
+        }
+
+        // Checkpoint must exist.
+        let cp_path = crate::state::checkpoint::Checkpoint::default_path(dir.path());
+        assert!(cp_path.exists(), "checkpoint must be written");
+
+        // All three artifacts must exist for each codergen node.
+        for node_id in &["plan", "implement", "review"] {
+            let node_dir = dir.path().join(node_id);
+            assert!(
+                node_dir.join("prompt.md").exists(),
+                "{node_id}/prompt.md must exist"
+            );
+            assert!(
+                node_dir.join("response.md").exists(),
+                "{node_id}/response.md must exist"
+            );
+            assert!(
+                node_dir.join("status.json").exists(),
+                "{node_id}/status.json must exist"
+            );
+
+            // status.json must have the correct field name ("outcome").
+            let status_text = std::fs::read_to_string(node_dir.join("status.json")).unwrap();
+            let status_json: serde_json::Value = serde_json::from_str(&status_text).unwrap();
+            assert_eq!(
+                status_json["outcome"], "success",
+                "{node_id}/status.json must have outcome=success"
+            );
+        }
+
+        // Goal gate node (review) must be in completed_nodes with success.
+        assert_eq!(
+            mock.call_count("review"),
+            1,
+            "review (goal_gate) called exactly once"
+        );
+
+        // Variable expansion: prompt.md for 'plan' must contain the expanded goal.
+        let plan_prompt =
+            std::fs::read_to_string(dir.path().join("plan").join("prompt.md")).unwrap();
+        assert!(
+            plan_prompt.contains("build feature X"),
+            "plan prompt must contain expanded $goal, got: {plan_prompt}"
+        );
     }
 }

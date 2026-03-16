@@ -6,6 +6,7 @@
 
 use crate::error::EngineError;
 use crate::graph::Value;
+use crate::state::context::Outcome;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -30,6 +31,13 @@ pub struct Checkpoint {
     pub context_values: HashMap<String, Value>,
     /// Run-log entries accumulated so far.
     pub logs: Vec<String>,
+    /// Actual outcomes for each completed node, keyed by node ID.
+    ///
+    /// Used on resume to restore true execution outcomes rather than
+    /// synthesising `Outcome::success()` for all completed nodes.
+    /// Absent in older checkpoints (defaults to empty map).
+    #[serde(default)]
+    pub node_outcomes: HashMap<String, Outcome>,
 }
 
 impl Checkpoint {
@@ -42,6 +50,7 @@ impl Checkpoint {
             node_retries: HashMap::new(),
             context_values: HashMap::new(),
             logs: Vec::new(),
+            node_outcomes: HashMap::new(),
         }
     }
 

@@ -11,6 +11,30 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 // ---------------------------------------------------------------------------
+// Bool coercion helper
+// ---------------------------------------------------------------------------
+
+/// Coerce a `Value` to `bool`.
+///
+/// Accepts:
+/// - `Value::Bool(b)` directly.
+/// - `Value::Str(s)` where `s` case-insensitively equals `"true"` → `true`,
+///   or `"false"` → `false`.
+///
+/// Returns `None` for any other variant or unrecognised string.
+fn value_as_bool(v: &Value) -> Option<bool> {
+    match v {
+        Value::Bool(b) => Some(*b),
+        Value::Str(s) => match s.to_ascii_lowercase().as_str() {
+            "true" => Some(true),
+            "false" => Some(false),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Value — typed attribute value
 // ---------------------------------------------------------------------------
 
@@ -229,8 +253,8 @@ impl Node {
                     }
                 }
                 "goal_gate" => {
-                    if let Value::Bool(b) = &val {
-                        self.goal_gate = *b;
+                    if let Some(b) = value_as_bool(&val) {
+                        self.goal_gate = b;
                     }
                 }
                 "retry_target" => self.retry_target = val.to_string_repr(),
@@ -247,13 +271,13 @@ impl Node {
                 "llm_provider" => self.llm_provider = val.to_string_repr(),
                 "reasoning_effort" => self.reasoning_effort = val.to_string_repr(),
                 "auto_status" => {
-                    if let Value::Bool(b) = &val {
-                        self.auto_status = *b;
+                    if let Some(b) = value_as_bool(&val) {
+                        self.auto_status = b;
                     }
                 }
                 "allow_partial" => {
-                    if let Value::Bool(b) = &val {
-                        self.allow_partial = *b;
+                    if let Some(b) = value_as_bool(&val) {
+                        self.allow_partial = b;
                     }
                 }
                 _ => {
@@ -304,8 +328,8 @@ impl Edge {
                 "fidelity" => self.fidelity = val.to_string_repr(),
                 "thread_id" => self.thread_id = val.to_string_repr(),
                 "loop_restart" => {
-                    if let Value::Bool(b) = val {
-                        self.loop_restart = *b;
+                    if let Some(b) = value_as_bool(val) {
+                        self.loop_restart = b;
                     }
                 }
                 _ => {} // unknown edge attrs are silently ignored
@@ -526,5 +550,75 @@ mod tests {
         assert_eq!(e.label, "Yes");
         assert_eq!(e.weight, 5);
         assert_eq!(e.condition, "outcome=success");
+    }
+
+    // --- V2-ATR-001: Bool coercion ---
+
+    #[test]
+    fn edge_apply_attrs_loop_restart_string_true() {
+        // V2-ATR-001: loop_restart="true" (a quoted string → Value::Str) must be
+        // coerced to bool true, not silently ignored.
+        let mut e = Edge::default();
+        assert!(!e.loop_restart, "loop_restart starts false");
+        let mut attrs = HashMap::new();
+        attrs.insert("loop_restart".to_string(), Value::Str("true".to_string()));
+        e.apply_attrs(&attrs);
+        assert!(
+            e.loop_restart,
+            "loop_restart=\"true\" must set loop_restart=true"
+        );
+    }
+
+    #[test]
+    fn edge_apply_attrs_loop_restart_string_false() {
+        // V2-ATR-001: loop_restart="false" must set loop_restart=false.
+        let mut e = Edge {
+            loop_restart: true,
+            ..Default::default()
+        };
+        let mut attrs = HashMap::new();
+        attrs.insert("loop_restart".to_string(), Value::Str("false".to_string()));
+        e.apply_attrs(&attrs);
+        assert!(
+            !e.loop_restart,
+            "loop_restart=\"false\" must set loop_restart=false"
+        );
+    }
+
+    #[test]
+    fn node_apply_attrs_goal_gate_string_true() {
+        // V2-ATR-001: goal_gate="true" (quoted string) must be coerced to bool true.
+        let mut n = Node::default();
+        assert!(!n.goal_gate, "goal_gate starts false");
+        let mut attrs = HashMap::new();
+        attrs.insert("goal_gate".to_string(), Value::Str("true".to_string()));
+        n.apply_attrs(attrs);
+        assert!(n.goal_gate, "goal_gate=\"true\" must set goal_gate=true");
+    }
+
+    #[test]
+    fn node_apply_attrs_auto_status_string_true() {
+        // V2-ATR-001: auto_status="true" (quoted string) must be coerced to bool true.
+        let mut n = Node::default();
+        let mut attrs = HashMap::new();
+        attrs.insert("auto_status".to_string(), Value::Str("true".to_string()));
+        n.apply_attrs(attrs);
+        assert!(
+            n.auto_status,
+            "auto_status=\"true\" must set auto_status=true"
+        );
+    }
+
+    #[test]
+    fn node_apply_attrs_allow_partial_string_true() {
+        // V2-ATR-001: allow_partial="true" (quoted string) must be coerced.
+        let mut n = Node::default();
+        let mut attrs = HashMap::new();
+        attrs.insert("allow_partial".to_string(), Value::Str("true".to_string()));
+        n.apply_attrs(attrs);
+        assert!(
+            n.allow_partial,
+            "allow_partial=\"true\" must set allow_partial=true"
+        );
     }
 }

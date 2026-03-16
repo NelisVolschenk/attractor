@@ -11,7 +11,7 @@
 //! | `terminal_node`       | ERROR    | At least one Msquare node |
 //! | `start_no_incoming`   | ERROR    | Start node has no incoming edges |
 //! | `exit_no_outgoing`    | ERROR    | Exit node(s) have no outgoing edges |
-//! | `reachability`        | ERROR    | All nodes reachable from start via BFS |
+//! | `reachability`        | WARNING  | All nodes reachable from start via BFS |
 //! | `edge_target_exists`  | ERROR    | Edge from/to reference existing nodes |
 //! | `condition_syntax`    | ERROR    | Edge condition strings parse correctly |
 //! | `stylesheet_syntax`   | ERROR    | model_stylesheet parses correctly |
@@ -210,13 +210,20 @@ impl LintRule for TerminalNodeRule {
             .filter(|n| n.shape == "Msquare")
             .map(|n| n.id.as_str())
             .collect();
-        if exits.is_empty() {
-            vec![
+        match exits.len() {
+            0 => vec![
                 Diagnostic::error("terminal_node", "pipeline has no exit node (shape=Msquare)")
                     .with_fix("add a node with shape=Msquare"),
-            ]
-        } else {
-            vec![]
+            ],
+            1 => vec![],
+            _ => vec![Diagnostic::error(
+                "terminal_node",
+                format!(
+                    "pipeline has {} exit nodes (shape=Msquare): {}; exactly one is required",
+                    exits.len(),
+                    exits.join(", ")
+                ),
+            )],
         }
     }
 }
@@ -318,7 +325,7 @@ impl LintRule for ReachabilityRule {
             .keys()
             .filter(|id| !visited.contains(*id))
             .map(|id| {
-                Diagnostic::error(
+                Diagnostic::warning(
                     "reachability",
                     format!("node '{id}' is not reachable from the start node"),
                 )
@@ -766,6 +773,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn multiple_exit_nodes_error() {
+        // V2-ATR-003: NLSpec §11.2 "Exactly one exit node (shape=Msquare) is required".
+        // Two Msquare nodes must produce an ERROR diagnostic.
+        let mut g = minimal_valid_graph();
+        let mut exit2 = Node::default();
+        exit2.id = "exit2".to_string();
+        exit2.shape = "Msquare".to_string();
+        exit2.label = "Exit2".to_string();
+        g.nodes.insert("exit2".to_string(), exit2);
+        let diags = validate(&g, &[]);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.rule == "terminal_node" && d.severity == Severity::Error),
+            "Two Msquare nodes must produce a terminal_node ERROR; got: {diags:?}"
+        );
+    }
+
     // --- start_no_incoming ---
 
     #[test]
@@ -816,6 +842,26 @@ mod tests {
             diags
                 .iter()
                 .any(|d| d.rule == "reachability" && d.node_id.as_deref() == Some("orphan"))
+        );
+    }
+
+    #[test]
+    fn orphan_node_is_warning_not_error() {
+        // NLSpec §11.12 parity matrix: "orphan node → warning"
+        let mut g = linear_3node_graph();
+        let mut orphan = Node::default();
+        orphan.id = "orphan".to_string();
+        orphan.shape = "box".to_string();
+        g.nodes.insert("orphan".to_string(), orphan);
+        let diags = validate(&g, &[]);
+        let reachability_diag = diags
+            .iter()
+            .find(|d| d.rule == "reachability" && d.node_id.as_deref() == Some("orphan"))
+            .expect("expected a reachability diagnostic for orphan node");
+        assert_eq!(
+            reachability_diag.severity,
+            Severity::Warning,
+            "orphan node should produce a Warning, not an Error"
         );
     }
 
@@ -939,6 +985,56 @@ mod tests {
                 .iter()
                 .any(|d| d.rule == "type_known" && d.severity == Severity::Warning)
         );
+    }
+
+    // --- GAP-ATR-004: prompt_on_llm_nodes boundary ---
+
+    #[test]
+    fn prompt_warning_suppressed_by_label() {
+        // GAP-ATR-004: a node with empty `prompt` but non-empty `label`
+        // must NOT trigger the prompt_on_llm_nodes warning.
+        let mut g = linear_3node_graph();
+        // middle has shape=box (codergen), no prompt, but has a label set from the helper
+        // Confirm middle already has a label:
+        assert!(!g.nodes["middle"].label.is_empty());
+        // Explicitly clear prompt to be sure
+        g.nodes.get_mut("middle").unwrap().prompt = String::new();
+        let diags = validate(&g, &[]);
+        assert!(
+            !diags.iter().any(|d| d.rule == "prompt_on_llm_nodes"),
+            "node with empty prompt but non-empty label must not trigger prompt warning; got: {diags:?}"
+        );
+    }
+
+    // --- GAP-ATR-005: all Diagnostic fields populated ---
+
+    #[test]
+    fn all_diagnostic_fields_populated_simultaneously() {
+        // GAP-ATR-005: NLSpec §11.2 says lint results include rule name,
+        // severity, node/edge ID, and message — verify all four are present.
+        let mut g = linear_3node_graph();
+        // Add an orphan to trigger reachability warning (has node_id)
+        let mut orphan = Node::default();
+        orphan.id = "orphan".to_string();
+        orphan.shape = "box".to_string();
+        orphan.label = "Orphan".to_string();
+        g.nodes.insert("orphan".to_string(), orphan);
+
+        let diags = validate(&g, &[]);
+        let d = diags
+            .iter()
+            .find(|d| d.rule == "reachability" && d.node_id.as_deref() == Some("orphan"))
+            .expect("expected reachability diagnostic for orphan node");
+
+        // Verify all four fields are non-empty / present simultaneously
+        assert!(!d.rule.is_empty(), "rule must be non-empty");
+        assert!(!d.message.is_empty(), "message must be non-empty");
+        assert!(
+            d.node_id.is_some(),
+            "node_id must be Some(_) for a node-level diagnostic"
+        );
+        // severity is always populated (it's an enum, not Option)
+        let _severity = d.severity; // just touching it proves it's accessible
     }
 
     // --- custom rule ---

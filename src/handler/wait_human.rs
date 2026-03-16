@@ -73,7 +73,7 @@ impl Handler for WaitForHumanHandler {
 
         let question = Question {
             text: question_text,
-            question_type: QuestionType::MultipleChoice,
+            question_type: QuestionType::MultiSelect,
             options: options.clone(),
             default: None,
             timeout: node.timeout,

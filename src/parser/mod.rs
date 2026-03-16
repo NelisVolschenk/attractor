@@ -149,6 +149,10 @@ fn parse_one_statement<'a>(input: &'a str, graph: &mut Graph) -> IResult<&'a str
             if !new_ga.default_fidelity.is_empty() {
                 ga.default_fidelity = new_ga.default_fidelity;
             }
+            // Always merge default_max_retry so `graph [default_max_retry=0]` works.
+            // GraphAttrs::from_attrs initialises this to 50, which is the same as
+            // Graph::new()'s default, so merging a 50 is a no-op.
+            ga.default_max_retry = new_ga.default_max_retry;
             ga.extra.extend(new_ga.extra);
             return Ok((rest, ()));
         }
@@ -825,5 +829,32 @@ digraph {
         let dot = r#"digraph { A [shape=Mdiamond] B [shape=Msquare] A -> B [weight=5] }"#;
         let g = parse_dot(dot).expect("edge weight");
         assert_eq!(g.edges[0].weight, 5);
+    }
+
+    // --- GAP-ATR-001 / GAP-ATR-017: multi-line attribute blocks ---
+
+    #[test]
+    fn parse_multiline_attribute_block() {
+        // NLSpec §11.1 + §11.12 parity matrix: attributes may span multiple lines
+        // inside a `[...]` block — the parser must handle embedded newlines.
+        let dot = r#"
+digraph {
+    start [shape=Mdiamond]
+    exit  [shape=Msquare]
+    review [
+        shape=hexagon,
+        label="Review Changes",
+        type="wait.human",
+        prompt="Please review the code changes"
+    ]
+    start -> review -> exit
+}
+"#;
+        let g = parse_dot(dot).expect("multi-line attr block should parse");
+        let node = &g.nodes["review"];
+        assert_eq!(node.shape, "hexagon");
+        assert_eq!(node.label, "Review Changes");
+        assert_eq!(node.node_type, "wait.human");
+        assert_eq!(node.prompt, "Please review the code changes");
     }
 }
