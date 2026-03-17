@@ -50,6 +50,75 @@ impl Handler for WaitForHumanHandler {
             return Ok(Outcome::fail("No outgoing edges for human gate"));
         }
 
+        // 2. Check for freeform mode (SRV-BUG-004).
+        //
+        // Hexagon nodes with `mode="freeform"` present a free-text textarea
+        // instead of a checkbox list.  The user's response is stored in
+        // context as `human.gate.response` and the pipeline routes via the
+        // first outgoing edge.
+        let is_freeform = matches!(
+            node.extra.get("mode"),
+            Some(Value::Str(s)) if s == "freeform"
+        );
+
+        if is_freeform {
+            let question_text = if !node.label.is_empty() {
+                node.label.clone()
+            } else {
+                "Enter your response:".to_string()
+            };
+
+            let question = Question {
+                text: question_text,
+                question_type: QuestionType::FreeText,
+                options: vec![],
+                default: None,
+                timeout: node.timeout,
+                stage: node.id.clone(),
+                metadata: HashMap::new(),
+            };
+
+            let answer = self.interviewer.ask(question).await;
+
+            match &answer.value {
+                AnswerValue::Timeout => {
+                    if let Some(Value::Str(default_choice)) =
+                        node.extra.get("human.default_choice")
+                    {
+                        let preferred = default_choice.clone();
+                        let outcome = build_freeform_outcome(&preferred, &edges, "");
+                        write_status(logs_root, &node.id, &outcome).await?;
+                        return Ok(outcome);
+                    }
+                    return Ok(Outcome::retry("human gate timeout, no default"));
+                }
+                AnswerValue::Skipped => {
+                    return Ok(Outcome::fail("human skipped interaction"));
+                }
+                _ => {}
+            }
+
+            let response_text = answer.text.clone();
+
+            // Route via the first outgoing edge label.
+            let route_label = edges
+                .first()
+                .map(|e| {
+                    if !e.label.is_empty() {
+                        e.label.as_str()
+                    } else {
+                        e.to.as_str()
+                    }
+                })
+                .unwrap_or("")
+                .to_string();
+
+            let outcome = build_freeform_outcome(&route_label, &edges, &response_text);
+            write_status(logs_root, &node.id, &outcome).await?;
+            return Ok(outcome);
+        }
+
+        // 3. Standard mode: derive choices from outgoing edges.
         let mut options: Vec<QuestionOption> = Vec::new();
         for edge in &edges {
             let display_label = if !edge.label.is_empty() {
@@ -64,7 +133,7 @@ impl Handler for WaitForHumanHandler {
             });
         }
 
-        // 2. Build question.
+        // 4. Build question.
         let question_text = if !node.label.is_empty() {
             node.label.clone()
         } else {
@@ -131,6 +200,46 @@ impl Handler for WaitForHumanHandler {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Build the [`Outcome`] for a freeform gate node.
+///
+/// Routes via the first outgoing edge whose label matches `route_label`, and
+/// stores the human's free-text response in `human.gate.response`.
+fn build_freeform_outcome(
+    route_label: &str,
+    edges: &[&crate::graph::Edge],
+    response_text: &str,
+) -> Outcome {
+    let suggested: Vec<String> = edges
+        .iter()
+        .filter(|e| {
+            let display = if !e.label.is_empty() {
+                e.label.as_str()
+            } else {
+                e.to.as_str()
+            };
+            display == route_label
+        })
+        .map(|e| e.to.clone())
+        .collect();
+
+    let mut context_updates = HashMap::new();
+    context_updates.insert(
+        "human.gate.response".to_string(),
+        Value::Str(response_text.to_string()),
+    );
+    context_updates.insert(
+        "human.gate.label".to_string(),
+        Value::Str(route_label.to_string()),
+    );
+
+    Outcome {
+        preferred_label: route_label.to_string(),
+        suggested_next_ids: suggested,
+        context_updates,
+        ..Outcome::success()
+    }
+}
 
 /// Build the [`Outcome`] for the selected label.
 fn build_outcome(
@@ -276,7 +385,10 @@ pub fn normalize_label(label: &str) -> String {
 mod tests {
     use super::*;
     use crate::graph::{Edge, Graph, Node};
-    use crate::interviewer::{Answer, AutoApproveInterviewer, QueueInterviewer};
+    use crate::interviewer::{
+        Answer, AnswerValue, AutoApproveInterviewer, QueueInterviewer, QuestionType,
+        RecordingInterviewer,
+    };
     use crate::state::context::StageStatus;
     use std::sync::Arc;
 
@@ -456,6 +568,94 @@ mod tests {
             .unwrap();
         let path = dir.path().join("gate").join("status.json");
         assert!(path.exists());
+    }
+
+    // -- Freeform mode tests (SRV-BUG-004) --
+
+    fn make_freeform_graph(node_id: &str) -> (Graph, Node) {
+        let mut g = Graph::new("test".into());
+        let mut node = Node::default();
+        node.id = node_id.to_string();
+        node.label = "Brainstorm with Human".to_string();
+        node.shape = "hexagon".to_string();
+        node.extra.insert("mode".to_string(), Value::Str("freeform".to_string()));
+        g.nodes.insert(node_id.to_string(), node.clone());
+
+        let mut target = Node::default();
+        target.id = "next_node".to_string();
+        g.nodes.insert("next_node".to_string(), target);
+
+        g.edges.push(Edge {
+            from: node_id.to_string(),
+            to: "next_node".to_string(),
+            label: "RefineUnderstanding".to_string(),
+            ..Default::default()
+        });
+        (g, node)
+    }
+
+    #[tokio::test]
+    async fn freeform_mode_asks_free_text_question() {
+        // RED: current code always creates MultiSelect; this must fail before the fix.
+        let dir = tempfile::tempdir().unwrap();
+        let (g, node) = make_freeform_graph("brainstorm");
+
+        let answer = Answer {
+            value: AnswerValue::Selected("I want to build a task manager".to_string()),
+            selected_option: None,
+            text: "I want to build a task manager".to_string(),
+        };
+        let queue_iv = QueueInterviewer::new(vec![answer]);
+        let recording_iv = Arc::new(RecordingInterviewer::new(queue_iv));
+        let handler = WaitForHumanHandler::new(recording_iv.clone());
+
+        let ctx = Context::new();
+        let _ = handler.execute(&node, &ctx, &g, dir.path()).await.unwrap();
+
+        let recordings = recording_iv.recordings();
+        assert_eq!(recordings.len(), 1);
+        assert_eq!(
+            recordings[0].question.question_type,
+            QuestionType::FreeText,
+            "freeform mode must ask a FreeText question, not {:?}",
+            recordings[0].question.question_type
+        );
+    }
+
+    #[tokio::test]
+    async fn freeform_mode_stores_response_in_context() {
+        // RED: current code does not set human.gate.response; this must fail before fix.
+        let dir = tempfile::tempdir().unwrap();
+        let (g, node) = make_freeform_graph("brainstorm");
+
+        let answer = Answer {
+            value: AnswerValue::Selected("I want to build a task manager".to_string()),
+            selected_option: None,
+            text: "I want to build a task manager".to_string(),
+        };
+        let iv = Arc::new(QueueInterviewer::new(vec![answer]));
+        let handler = WaitForHumanHandler::new(iv);
+
+        let ctx = Context::new();
+        let outcome = handler.execute(&node, &ctx, &g, dir.path()).await.unwrap();
+
+        assert_eq!(outcome.status, StageStatus::Success);
+
+        assert!(
+            outcome.context_updates.contains_key("human.gate.response"),
+            "freeform mode must store response in context as human.gate.response"
+        );
+        let response = outcome.context_updates.get("human.gate.response").unwrap();
+        assert_eq!(
+            response,
+            &Value::Str("I want to build a task manager".to_string()),
+            "human.gate.response must contain the user's free text"
+        );
+
+        assert!(
+            outcome.suggested_next_ids.contains(&"next_node".to_string()),
+            "freeform mode must route to the outgoing edge target"
+        );
     }
 
     #[tokio::test]

@@ -71,12 +71,20 @@ impl Handler for ToolHandler {
 
         if output.status.success() {
             context_updates.insert("tool.output".to_string(), Value::Str(stdout.clone()));
+            // SRV-BUG-005: DOT edge conditions use `context.tool_stdout` (e.g.
+            // `condition="context.tool_stdout=done"`) but the handler only stored
+            // stdout as `tool.output`.  Store it under `tool_stdout` as well so
+            // all existing dotpowers.dot conditions resolve correctly.
+            context_updates.insert("tool_stdout".to_string(), Value::Str(stdout.clone()));
             Ok(Outcome {
                 notes: format!("Tool completed: {command}"),
                 context_updates,
                 ..Outcome::success()
             })
         } else {
+            // Non-zero exit: still expose stdout/stderr for condition checks.
+            context_updates.insert("tool.output".to_string(), Value::Str(stdout.clone()));
+            context_updates.insert("tool_stdout".to_string(), Value::Str(stdout.clone()));
             Ok(Outcome {
                 failure_reason: format!("Tool exited with code {exit_code}: {stderr}"),
                 context_updates,
@@ -124,6 +132,31 @@ mod tests {
         assert_eq!(
             outcome.context_updates.get("tool.exit_code"),
             Some(&Value::Int(0))
+        );
+    }
+
+    /// SRV-BUG-005: DOT edge conditions use `context.tool_stdout` but
+    /// ToolHandler only stored stdout as `tool.output`.  The handler must
+    /// ALSO store stdout under the `tool_stdout` key so conditions like
+    /// `context.tool_stdout=done` can resolve correctly.
+    #[tokio::test]
+    async fn stdout_stored_as_tool_stdout_key_for_conditions() {
+        let dir = tempfile::tempdir().unwrap();
+        let handler = ToolHandler;
+        let node = make_node_with_command("printf 'done'");
+        let ctx = Context::new();
+        let graph = Graph::new("t".into());
+        let outcome = handler
+            .execute(&node, &ctx, &graph, dir.path())
+            .await
+            .unwrap();
+        assert_eq!(outcome.status, StageStatus::Success);
+        // Must be stored under tool_stdout for DOT conditions like
+        // condition="context.tool_stdout=done"
+        assert_eq!(
+            outcome.context_updates.get("tool_stdout"),
+            Some(&Value::Str("done".to_string())),
+            "tool_stdout key required for DOT edge conditions"
         );
     }
 
