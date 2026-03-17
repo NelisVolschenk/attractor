@@ -49,13 +49,31 @@ use uuid::Uuid;
 pub struct RunConfig {
     /// Directory for logs, checkpoints, and artifacts.
     pub logs_root: PathBuf,
+    /// Maximum number of node executions before the pipeline is forcibly
+    /// terminated with a "max iterations exceeded" failure.
+    ///
+    /// This prevents infinite loops (e.g. DraftPlan→ValidatePlanFormat cycles)
+    /// from consuming all server resources.  Defaults to 1000.
+    pub max_iterations: usize,
 }
 
 impl RunConfig {
     pub fn new(logs_root: impl Into<PathBuf>) -> Self {
         RunConfig {
             logs_root: logs_root.into(),
+            max_iterations: 1000,
         }
+    }
+
+    /// Override the default maximum iteration limit.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let config = RunConfig::new("/tmp/logs").with_max_iterations(5);
+    /// ```
+    pub fn with_max_iterations(mut self, limit: usize) -> Self {
+        self.max_iterations = limit;
+        self
     }
 }
 
@@ -255,8 +273,26 @@ impl PipelineRunner {
     ) -> Result<RunResult, EngineError> {
         let pipeline_start = Instant::now();
         let mut last_outcome = Outcome::success();
+        let mut iteration_count: usize = 0;
 
         loop {
+            // SRV-BUG-002: guard against infinite loops.
+            iteration_count += 1;
+            if iteration_count > config.max_iterations {
+                let duration = pipeline_start.elapsed();
+                let error_msg = format!(
+                    "max iterations exceeded ({} iterations, limit={})",
+                    config.max_iterations, config.max_iterations
+                );
+                let _ = self.event_tx.send(PipelineEvent::PipelineFailed {
+                    error: error_msg.clone(),
+                    duration,
+                });
+                return Err(EngineError::Handler {
+                    node_id: current_node_id.clone(),
+                    message: error_msg,
+                });
+            }
             // Fetch the current node.
             let node = match graph.node(&current_node_id) {
                 Some(n) => n.clone(),
@@ -1622,5 +1658,76 @@ digraph smoke_test {
             plan_prompt.contains("build feature X"),
             "plan prompt must contain expanded $goal, got: {plan_prompt}"
         );
+    }
+
+    // ---------------------------------------------------------------------------
+    // SRV-BUG-002: max_iterations safety limit
+    // ---------------------------------------------------------------------------
+
+    /// Verify that a pipeline with a runtime loop terminates with an error after
+    /// exceeding `max_iterations`.
+    ///
+    /// RED: before the counter was added to execute_loop, this test would hang.
+    /// GREEN: the engine breaks after `max_iterations` and returns an error.
+    ///
+    /// Loop mechanism: `task` has `goal_gate=true` + `retry_target="task"`.
+    /// When task fails, the engine advances to exit, the goal gate check fails
+    /// (task had a Fail outcome), and `resolve_gate_retry_target` routes back
+    /// to task via the node-level retry_target, creating an infinite loop.
+    ///
+    /// `max_retries=1` on task limits internal retry delays to ~200 ms so the
+    /// test completes in under a second.
+    #[tokio::test]
+    async fn max_iterations_prevents_infinite_loop() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Structurally valid DOT — has both start and exit nodes so it passes
+        // validation — but creates a runtime loop via the goal_gate mechanism:
+        // task fails → exit → goal gate fires → back to task → forever.
+        let dot = r#"
+digraph loop_test {
+    graph [goal="loop prevention test"]
+    start [shape=Mdiamond]
+    exit  [shape=Msquare]
+    task  [prompt="will always fail", goal_gate=true, max_retries=1, retry_target="task"]
+    start -> task -> exit
+}
+"#;
+        // Backend: Fail for every node (including `task`), which keeps the
+        // goal gate unsatisfied on every iteration.
+        let mock = Arc::new(MockCodergenBackend::new().with_default(
+            crate::state::context::Outcome::fail("always fail"),
+        ));
+        let (runner, _rx) = make_runner(mock.clone());
+
+        // Limit to 5 iterations so the test completes in < 1 second.
+        let config = RunConfig::new(dir.path()).with_max_iterations(5);
+        let result = runner.run(dot, config).await;
+
+        // Must fail — not hang.
+        assert!(
+            result.is_err(),
+            "looping pipeline must fail when max_iterations is exceeded; got Ok"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("max iterations exceeded"),
+            "error must mention 'max iterations exceeded'; got: {err_msg}"
+        );
+    }
+
+    /// Verify that a normal (non-looping) pipeline still completes when
+    /// max_iterations is comfortably above the number of nodes.
+    #[tokio::test]
+    async fn max_iterations_does_not_block_normal_pipeline() {
+        let dir = tempfile::tempdir().unwrap();
+        let mock = Arc::new(MockCodergenBackend::new());
+        let (runner, _rx) = make_runner(mock.clone());
+        let dot = linear_dot("normal run", vec!["task"]);
+
+        // 1000 iterations is far more than the 3 nodes (start→task→exit).
+        let config = RunConfig::new(dir.path()).with_max_iterations(1000);
+        let result = runner.run(&dot, config).await.unwrap();
+        assert_eq!(result.status, StageStatus::Success);
     }
 }
