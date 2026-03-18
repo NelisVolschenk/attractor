@@ -21,8 +21,11 @@ use attractor::events::PipelineEvent;
 use attractor::graph::Node;
 use attractor::handler::{CodergenBackend, CodergenHandler, CodergenResult};
 use attractor::state::context::Context;
+use coding_agent_loop::profile::{anthropic_profile, gemini_profile, openai_profile};
+use coding_agent_loop::turns::Turn;
+use coding_agent_loop::{LocalExecutionEnvironment, Session, SessionConfig};
 use regex::Regex;
-use unified_llm::{Client, GenerateParams, generate};
+use unified_llm::Client;
 
 // ---------------------------------------------------------------------------
 // CLI definition
@@ -72,7 +75,13 @@ pub enum Commands {
 // LLM CodergenBackend
 // ---------------------------------------------------------------------------
 
-/// A [`CodergenBackend`] that calls the LLM API via [`unified_llm`].
+/// A [`CodergenBackend`] that runs a full agentic tool loop via
+/// [`coding_agent_loop::Session`].
+///
+/// Each `run()` call creates a fresh `Session` with the appropriate
+/// [`ProviderProfile`](coding_agent_loop::profile::ProviderProfile), submits
+/// the prompt, and collects the final assistant text after all tool calls
+/// have been executed.
 ///
 /// Uses [`Client::from_env()`] so it picks up API keys from environment
 /// variables (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GOOGLE_API_KEY`).
@@ -94,6 +103,21 @@ impl LlmCodergenBackend {
     }
 }
 
+/// Infer the LLM provider from a model name string.
+///
+/// Returns `"anthropic"`, `"gemini"`, or `"openai"` (the default fallback).
+fn infer_provider(model: &str) -> &'static str {
+    let m = model.trim().to_lowercase();
+    if m.starts_with("claude") {
+        "anthropic"
+    } else if m.starts_with("gemini") {
+        "gemini"
+    } else {
+        // Covers gpt-*, o1-*, o3-*, codex-*, and anything else.
+        "openai"
+    }
+}
+
 #[async_trait]
 impl CodergenBackend for LlmCodergenBackend {
     async fn run(
@@ -102,71 +126,74 @@ impl CodergenBackend for LlmCodergenBackend {
         prompt: &str,
         ctx: &Context,
     ) -> Result<CodergenResult, EngineError> {
-        // Honour the per-node model if the stylesheet/DOT set one.
+        // 1. Resolve model: node-level override > default.
         let model = if !node.llm_model.is_empty() {
             node.llm_model.clone()
         } else {
             self.default_model.clone()
         };
 
-        // Prepend any available pipeline context (human feedback, prior step
-        // output, prior step name) so the LLM has multi-turn awareness.
-        let context_prefix = build_context_prefix(ctx);
-        let full_prompt = format!("{context_prefix}{prompt}");
+        // 2. Resolve provider: node-level override > infer from model name.
+        let provider_id = if !node.llm_provider.is_empty() {
+            node.llm_provider.as_str()
+        } else {
+            infer_provider(&model)
+        };
 
-        let mut params = GenerateParams::new(model, &full_prompt);
-        params.client = Some(self.client.clone());
+        // 3. Select the appropriate provider profile (tool set + system prompt).
+        let profile = match provider_id {
+            "anthropic" => anthropic_profile(&model),
+            "gemini" => gemini_profile(&model),
+            _ => openai_profile(&model),
+        };
 
-        // Route to the node's explicit provider when specified.
-        // Without this, the Client defaults to the first registered provider,
-        // which rejects model names belonging to other providers.
-        if !node.llm_provider.is_empty() {
-            params.provider = Some(node.llm_provider.clone());
+        // 4. Resolve working directory from pipeline context.
+        let working_dir_str = ctx.get_string("_working_dir");
+        let working_dir = if working_dir_str.is_empty() {
+            std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir())
+        } else {
+            PathBuf::from(&working_dir_str)
+        };
+        let env = Box::new(LocalExecutionEnvironment::new(&working_dir));
+
+        // 5. Configure the session with reasonable limits for a pipeline node.
+        let mut config = SessionConfig::default();
+        config.max_tool_rounds_per_input = 50; // prevent runaway tool loops
+
+        // Only override reasoning_effort when the DOT author explicitly set a
+        // non-default value.  The parser defaults every node to "high", so
+        // forwarding it unconditionally would inject reasoning_effort into
+        // requests for models that don't support it (e.g. gpt-4o, gemini).
+        // SessionConfig::default() leaves it as None, which is correct for
+        // all models.  Only explicit "low"/"medium" overrides take effect.
+        if !node.reasoning_effort.is_empty() && node.reasoning_effort != "high" {
+            config.reasoning_effort = Some(node.reasoning_effort.clone());
         }
 
-        let result = generate(params).await.map_err(|e| EngineError::Handler {
+        // 6. Create a fresh Session and run the agentic loop.
+        let mut session = Session::new(config, profile, env, self.client.clone());
+
+        session.submit(prompt).await.map_err(|e| EngineError::Handler {
             node_id: node.id.clone(),
-            message: format!("LLM call failed: {e}"),
+            message: format!("agent session failed: {e}"),
         })?;
 
-        Ok(CodergenResult::Text(result.text))
-    }
-}
+        // 7. Extract the last non-empty assistant text from the session history.
+        let text = session
+            .history()
+            .turns()
+            .iter()
+            .rev()
+            .find_map(|t| match t {
+                Turn::Assistant(a) if !a.content.is_empty() => Some(a.content.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
 
-// ---------------------------------------------------------------------------
-// Context prefix helper
-// ---------------------------------------------------------------------------
+        // 8. Graceful shutdown (flush events, clean up subagents).
+        session.shutdown().await;
 
-/// Pipeline context key: human gate answer from a previous approval step.
-const CTX_HUMAN_RESPONSE: &str = "human.gate.response";
-
-/// Pipeline context key: text output produced by the most recent stage.
-const CTX_LAST_RESPONSE: &str = "last_response";
-
-/// Pipeline context key: name of the most recently completed stage.
-const CTX_LAST_STAGE: &str = "last_stage";
-
-/// Build a context prefix string from relevant pipeline context keys.
-///
-/// If any of `human.gate.response`, `last_response`, or `last_stage` are
-/// present in the context, they are formatted into a `[Pipeline Context]`
-/// header block that can be prepended to an LLM prompt.  Returns an empty
-/// string when none of the keys are set.
-fn build_context_prefix(ctx: &Context) -> String {
-    let mut sections = Vec::new();
-    if let Some(val) = ctx.get(CTX_HUMAN_RESPONSE) {
-        sections.push(format!("Human feedback: {}", val.to_string_repr()));
-    }
-    if let Some(val) = ctx.get(CTX_LAST_RESPONSE) {
-        sections.push(format!("Previous step output: {}", val.to_string_repr()));
-    }
-    if let Some(val) = ctx.get(CTX_LAST_STAGE) {
-        sections.push(format!("Previous step: {}", val.to_string_repr()));
-    }
-    if sections.is_empty() {
-        String::new()
-    } else {
-        format!("[Pipeline Context]\n{}\n\n", sections.join("\n"))
+        Ok(CodergenResult::Text(text))
     }
 }
 
@@ -372,7 +399,8 @@ pub async fn run_pipeline(
     println!("attractor: running {}", file.display());
     println!("attractor: logs → {}", logs_root.display());
 
-    let config = RunConfig::new(&logs_root);
+    let config = RunConfig::new(&logs_root)
+        .with_working_dir(std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir()));
     let result = runner.run(&dot, config).await;
 
     // Wait for the event printer to drain.
@@ -432,8 +460,6 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use attractor::graph::Value;
-    use attractor::state::context::Context;
     use clap::Parser;
 
     // ── Cli defaults ──────────────────────────────────────────────────────
@@ -559,65 +585,49 @@ mod tests {
         );
     }
 
+    // ── infer_provider ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn infer_provider_openai_models() {
+        assert_eq!(infer_provider("gpt-4o"), "openai");
+        assert_eq!(infer_provider("gpt-4o-mini"), "openai");
+        assert_eq!(infer_provider("o1-preview"), "openai");
+        assert_eq!(infer_provider("o3-mini"), "openai");
+        assert_eq!(infer_provider("codex-4o"), "openai");
+    }
+
+    #[test]
+    fn infer_provider_anthropic_models() {
+        assert_eq!(infer_provider("claude-opus-4-5"), "anthropic");
+        assert_eq!(infer_provider("claude-haiku-4-5-20251001"), "anthropic");
+        assert_eq!(infer_provider("claude-sonnet-4-20250514"), "anthropic");
+        // Case-insensitive: model strings from DOT may vary.
+        assert_eq!(infer_provider("Claude-3-Opus"), "anthropic");
+    }
+
+    #[test]
+    fn infer_provider_gemini_models() {
+        assert_eq!(infer_provider("gemini-2.5-pro"), "gemini");
+        assert_eq!(infer_provider("gemini-2.0-flash"), "gemini");
+        assert_eq!(infer_provider("Gemini-Pro"), "gemini");
+    }
+
+    #[test]
+    fn infer_provider_unknown_defaults_to_openai() {
+        assert_eq!(infer_provider("some-custom-model"), "openai");
+        assert_eq!(infer_provider("deepseek-r1"), "openai");
+        assert_eq!(infer_provider(""), "openai");
+    }
+
+    #[test]
+    fn infer_provider_trims_whitespace() {
+        // DOT attribute values may have leading/trailing whitespace.
+        assert_eq!(infer_provider(" claude-opus-4-5"), "anthropic");
+        assert_eq!(infer_provider("  gemini-2.5-pro  "), "gemini");
+        assert_eq!(infer_provider(" gpt-4o "), "openai");
+    }
+
     // ── ConsoleInterviewer trait-bound ─────────────────────────────────────────────
-
-    // ── build_context_prefix ───────────────────────────────────────────────────────────
-
-    #[test]
-    fn context_prefix_includes_human_response() {
-        let ctx = Context::new();
-        ctx.set(
-            "human.gate.response",
-            Value::Str("I want option B".to_string()),
-        );
-        let prefix = build_context_prefix(&ctx);
-        assert!(prefix.contains("[Pipeline Context]"));
-        assert!(prefix.contains("Human feedback: I want option B"));
-    }
-
-    #[test]
-    fn context_prefix_includes_last_response() {
-        let ctx = Context::new();
-        ctx.set("last_response", Value::Str("step 1 output".to_string()));
-        ctx.set("last_stage", Value::Str("ExploreIdea".to_string()));
-        let prefix = build_context_prefix(&ctx);
-        assert!(prefix.contains("Previous step output: step 1 output"));
-        assert!(prefix.contains("Previous step: ExploreIdea"));
-    }
-
-    #[test]
-    fn context_prefix_all_three_keys_ordering() {
-        // Verifies that when all three keys are present the output order is:
-        // human feedback first, then previous step output, then previous step.
-        let ctx = Context::new();
-        ctx.set("human.gate.response", Value::Str("approve it".to_string()));
-        ctx.set("last_response", Value::Str("generated code".to_string()));
-        ctx.set("last_stage", Value::Str("CodeGen".to_string()));
-        let prefix = build_context_prefix(&ctx);
-        assert!(prefix.contains("[Pipeline Context]"));
-        let human_pos = prefix
-            .find("Human feedback:")
-            .expect("human feedback present");
-        let output_pos = prefix
-            .find("Previous step output:")
-            .expect("step output present");
-        let stage_pos = prefix.find("Previous step:").expect("step name present");
-        assert!(
-            human_pos < output_pos,
-            "human feedback must come before step output"
-        );
-        assert!(
-            output_pos < stage_pos,
-            "step output must come before step name"
-        );
-    }
-
-    #[test]
-    fn context_prefix_empty_when_no_relevant_keys() {
-        let ctx = Context::new();
-        let prefix = build_context_prefix(&ctx);
-        assert!(prefix.is_empty());
-    }
 
     #[test]
     fn console_interviewer_implements_interviewer_trait() {

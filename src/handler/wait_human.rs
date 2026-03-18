@@ -64,6 +64,18 @@ impl Handler for WaitForHumanHandler {
             if let Some(prev) = context.get("human.gate.response") {
                 m.insert("previous_response".to_string(), prev.to_string_repr());
             }
+            // Add response_md_path so the interviewer can read the full response
+            // from disk rather than using the truncated last_response value.
+            if let Some(last_stage) = context.get("last_stage") {
+                let stage_name = last_stage.to_string_repr();
+                let response_md = logs_root.join(&stage_name).join("response.md");
+                if response_md.exists() {
+                    m.insert(
+                        "response_md_path".to_string(),
+                        response_md.to_string_lossy().to_string(),
+                    );
+                }
+            }
             m
         };
 
@@ -103,6 +115,8 @@ impl Handler for WaitForHumanHandler {
                     {
                         let preferred = default_choice.clone();
                         let outcome = build_freeform_outcome(&preferred, &edges, "");
+                        write_response_md(logs_root, &node.id, "[timeout — default choice]")
+                            .await?;
                         write_status(logs_root, &node.id, &outcome).await?;
                         return Ok(outcome);
                     }
@@ -130,6 +144,7 @@ impl Handler for WaitForHumanHandler {
                 .to_string();
 
             let outcome = build_freeform_outcome(&route_label, &edges, &response_text);
+            write_response_md(logs_root, &node.id, &response_text).await?;
             write_status(logs_root, &node.id, &outcome).await?;
             return Ok(outcome);
         }
@@ -176,6 +191,12 @@ impl Handler for WaitForHumanHandler {
                 if let Some(Value::Str(default_choice)) = node.extra.get("human.default_choice") {
                     let preferred = default_choice.clone();
                     let outcome = build_outcome(&preferred, &options, &edges);
+                    write_response_md(
+                        logs_root,
+                        &node.id,
+                        &format!("[timeout — default: {preferred}]"),
+                    )
+                    .await?;
                     write_status(logs_root, &node.id, &outcome).await?;
                     return Ok(outcome);
                 }
@@ -208,6 +229,7 @@ impl Handler for WaitForHumanHandler {
 
         // 6. Build outcome.
         let outcome = build_outcome(&selected_label, &options, &edges);
+        write_response_md(logs_root, &node.id, &selected_label).await?;
         write_status(logs_root, &node.id, &outcome).await?;
         Ok(outcome)
     }
@@ -300,6 +322,18 @@ fn build_outcome(
         context_updates,
         ..Outcome::success()
     }
+}
+
+/// Write `response.md` to `{logs_root}/{node_id}/response.md`.
+async fn write_response_md(
+    logs_root: &Path,
+    node_id: &str,
+    response_text: &str,
+) -> Result<(), EngineError> {
+    let stage_dir = logs_root.join(node_id);
+    fs::create_dir_all(&stage_dir).await?;
+    fs::write(stage_dir.join("response.md"), response_text).await?;
+    Ok(())
 }
 
 /// Write `status.json` to `{logs_root}/{node_id}/status.json`.
@@ -700,11 +734,18 @@ mod tests {
         let recordings = recording_iv.recordings();
         assert_eq!(recordings.len(), 1);
         assert!(
-            recordings[0].question.metadata.contains_key("last_response"),
+            recordings[0]
+                .question
+                .metadata
+                .contains_key("last_response"),
             "question metadata must contain last_response key"
         );
         assert_eq!(
-            recordings[0].question.metadata.get("last_response").unwrap(),
+            recordings[0]
+                .question
+                .metadata
+                .get("last_response")
+                .unwrap(),
             "LLM output text",
             "question metadata last_response must match context value"
         );
@@ -736,11 +777,18 @@ mod tests {
         let recordings = recording_iv.recordings();
         assert_eq!(recordings.len(), 1);
         assert!(
-            recordings[0].question.metadata.contains_key("previous_response"),
+            recordings[0]
+                .question
+                .metadata
+                .contains_key("previous_response"),
             "question metadata must contain previous_response key when human.gate.response is set"
         );
         assert_eq!(
-            recordings[0].question.metadata.get("previous_response").unwrap(),
+            recordings[0]
+                .question
+                .metadata
+                .get("previous_response")
+                .unwrap(),
             "Previous human reply",
         );
     }
@@ -759,5 +807,134 @@ mod tests {
             .unwrap();
         assert!(outcome.context_updates.contains_key("human.gate.selected"));
         assert!(outcome.context_updates.contains_key("human.gate.label"));
+    }
+
+    #[tokio::test]
+    async fn freeform_mode_writes_response_md() {
+        let dir = tempfile::tempdir().unwrap();
+        let (g, node) = make_freeform_graph("brainstorm");
+
+        let answer = Answer {
+            value: AnswerValue::Selected("My freeform response text".to_string()),
+            selected_option: None,
+            text: "My freeform response text".to_string(),
+        };
+        let iv = Arc::new(QueueInterviewer::new(vec![answer]));
+        let handler = WaitForHumanHandler::new(iv);
+
+        let ctx = Context::new();
+        handler.execute(&node, &ctx, &g, dir.path()).await.unwrap();
+
+        let path = dir.path().join("brainstorm").join("response.md");
+        assert!(
+            path.exists(),
+            "response.md should be written for freeform mode"
+        );
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(content, "My freeform response text");
+    }
+
+    #[tokio::test]
+    async fn standard_mode_writes_response_md() {
+        let dir = tempfile::tempdir().unwrap();
+        let iv = Arc::new(AutoApproveInterviewer);
+        let handler = WaitForHumanHandler::new(iv);
+        let graph = make_graph_with_edges("gate", &["[A] Approve", "[R] Reject"]);
+        let node = graph.node("gate").unwrap().clone();
+        let ctx = Context::new();
+        handler
+            .execute(&node, &ctx, &graph, dir.path())
+            .await
+            .unwrap();
+
+        let path = dir.path().join("gate").join("response.md");
+        assert!(
+            path.exists(),
+            "response.md should be written for standard mode"
+        );
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(content, "[A] Approve");
+    }
+
+    // -- response_md_path in metadata (task_6) --
+
+    #[tokio::test]
+    async fn wait_human_includes_response_md_path_when_last_stage_has_response_md() {
+        // RED: metadata does not yet include response_md_path.
+        let dir = tempfile::tempdir().unwrap();
+        let (g, node) = make_freeform_graph("brainstorm");
+
+        // Pre-create the response.md file for the last_stage node.
+        let last_stage_dir = dir.path().join("prev_node");
+        std::fs::create_dir_all(&last_stage_dir).unwrap();
+        std::fs::write(
+            last_stage_dir.join("response.md"),
+            "Full LLM output from disk",
+        )
+        .unwrap();
+
+        let answer = Answer {
+            value: AnswerValue::Selected("user response".to_string()),
+            selected_option: None,
+            text: "user response".to_string(),
+        };
+        let queue_iv = QueueInterviewer::new(vec![answer]);
+        let recording_iv = Arc::new(RecordingInterviewer::new(queue_iv));
+        let handler = WaitForHumanHandler::new(recording_iv.clone());
+
+        let ctx = Context::new();
+        ctx.set("last_stage", Value::Str("prev_node".to_string()));
+
+        let _ = handler.execute(&node, &ctx, &g, dir.path()).await.unwrap();
+
+        let recordings = recording_iv.recordings();
+        assert_eq!(recordings.len(), 1);
+        assert!(
+            recordings[0]
+                .question
+                .metadata
+                .contains_key("response_md_path"),
+            "question metadata must contain response_md_path when last_stage has a response.md"
+        );
+        let path_val = recordings[0]
+            .question
+            .metadata
+            .get("response_md_path")
+            .unwrap();
+        assert!(
+            path_val.ends_with("prev_node/response.md"),
+            "response_md_path must point to logs_root/last_stage/response.md, got: {path_val}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_human_omits_response_md_path_when_file_missing() {
+        // When last_stage is set but response.md doesn't exist, path must NOT be added.
+        let dir = tempfile::tempdir().unwrap();
+        let (g, node) = make_freeform_graph("brainstorm");
+
+        let answer = Answer {
+            value: AnswerValue::Selected("user response".to_string()),
+            selected_option: None,
+            text: "user response".to_string(),
+        };
+        let queue_iv = QueueInterviewer::new(vec![answer]);
+        let recording_iv = Arc::new(RecordingInterviewer::new(queue_iv));
+        let handler = WaitForHumanHandler::new(recording_iv.clone());
+
+        let ctx = Context::new();
+        ctx.set("last_stage", Value::Str("nonexistent_node".to_string()));
+
+        let _ = handler.execute(&node, &ctx, &g, dir.path()).await.unwrap();
+
+        let recordings = recording_iv.recordings();
+        assert_eq!(recordings.len(), 1);
+        assert!(
+            !recordings[0]
+                .question
+                .metadata
+                .contains_key("response_md_path"),
+            "question metadata must NOT contain response_md_path when file does not exist"
+        );
     }
 }

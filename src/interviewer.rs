@@ -379,13 +379,32 @@ impl<I: Interviewer + Send + Sync> Interviewer for RecordingInterviewer<I> {
 /// `"last_response"` key; `None` otherwise.  The caller is responsible for
 /// printing the returned string before showing the question text.
 pub fn format_llm_context_block(question: &Question) -> Option<String> {
-    match question.metadata.get("last_response") {
-        Some(llm_output) if !llm_output.is_empty() => Some(format!(
-            "--- LLM Output ---\n{}\n--- End Output ---\n",
-            llm_output
-        )),
-        _ => None,
-    }
+    // Prefer reading the full response from disk when response_md_path is in metadata.
+    let llm_output: String = if let Some(path_str) = question.metadata.get("response_md_path") {
+        match std::fs::read_to_string(path_str) {
+            Ok(content) if !content.is_empty() => content,
+            _ => {
+                // File missing or unreadable — fall back to truncated metadata value.
+                question
+                    .metadata
+                    .get("last_response")
+                    .filter(|s| !s.is_empty())
+                    .cloned()?
+            }
+        }
+    } else {
+        // No disk path; use last_response metadata value directly.
+        question
+            .metadata
+            .get("last_response")
+            .filter(|s| !s.is_empty())
+            .cloned()?
+    };
+
+    Some(format!(
+        "--- LLM Output ---\n{}\n--- End Output ---\n",
+        llm_output
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -754,19 +773,31 @@ mod tests {
             "must produce context block when last_response is in metadata"
         );
         let block_str = block.unwrap();
-        assert!(block_str.contains("--- LLM Output ---"), "must include header");
+        assert!(
+            block_str.contains("--- LLM Output ---"),
+            "must include header"
+        );
         assert!(
             block_str.contains("This is what the LLM produced."),
             "must include LLM content"
         );
-        assert!(block_str.contains("--- End Output ---"), "must include footer");
+        assert!(
+            block_str.contains("--- End Output ---"),
+            "must include footer"
+        );
 
         // Order: header → content → footer
         let header_pos = block_str.find("--- LLM Output ---").unwrap();
         let content_pos = block_str.find("This is what the LLM produced.").unwrap();
         let footer_pos = block_str.find("--- End Output ---").unwrap();
-        assert!(header_pos < content_pos, "header must appear before content");
-        assert!(content_pos < footer_pos, "content must appear before footer");
+        assert!(
+            header_pos < content_pos,
+            "header must appear before content"
+        );
+        assert!(
+            content_pos < footer_pos,
+            "content must appear before footer"
+        );
     }
 
     #[test]
@@ -804,5 +835,71 @@ mod tests {
             ])
             .await;
         assert_eq!(answers.len(), 3);
+    }
+
+    // -- format_llm_context_block disk reading (task_6) --
+
+    #[test]
+    fn format_llm_context_block_reads_from_disk_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let response_path = dir.path().join("response.md");
+        let full_content =
+            "This is the FULL LLM response from disk, much longer than any truncated version.";
+        std::fs::write(&response_path, full_content).unwrap();
+
+        let mut q = make_yesno_question();
+        q.metadata.insert(
+            "response_md_path".to_string(),
+            response_path.to_string_lossy().to_string(),
+        );
+        q.metadata
+            .insert("last_response".to_string(), "truncated...".to_string());
+
+        let block = format_llm_context_block(&q);
+        assert!(
+            block.is_some(),
+            "must produce context block when response_md_path is present"
+        );
+        let block_str = block.unwrap();
+        assert!(
+            block_str.contains(full_content),
+            "must include full content from disk, not truncated version"
+        );
+        assert!(
+            !block_str.contains("truncated..."),
+            "must not include the truncated metadata value when disk file is readable"
+        );
+    }
+
+    #[test]
+    fn format_llm_context_block_falls_back_to_metadata_when_file_missing() {
+        let mut q = make_yesno_question();
+        q.metadata.insert(
+            "response_md_path".to_string(),
+            "/nonexistent/path/that/does/not/exist/response.md".to_string(),
+        );
+        q.metadata.insert(
+            "last_response".to_string(),
+            "fallback content from metadata".to_string(),
+        );
+
+        let block = format_llm_context_block(&q);
+        assert!(
+            block.is_some(),
+            "must produce context block when falling back to last_response"
+        );
+        let block_str = block.unwrap();
+        assert!(
+            block_str.contains("fallback content from metadata"),
+            "must include fallback content from last_response metadata"
+        );
+        assert!(
+            block_str.contains("--- LLM Output ---"),
+            "must include header"
+        );
+        assert!(
+            block_str.contains("--- End Output ---"),
+            "must include footer"
+        );
     }
 }

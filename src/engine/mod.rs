@@ -28,6 +28,8 @@ use crate::interviewer::{AutoApproveInterviewer, Interviewer};
 use crate::parser::parse_dot;
 use crate::state::checkpoint::Checkpoint;
 use crate::state::context::{Context, Outcome, StageStatus};
+use crate::state::fidelity::{resolve_fidelity, resolve_thread_id};
+use crate::state::preamble::build_preamble;
 use crate::transform::{
     StylesheetApplicationTransform, Transform, VariableExpansionTransform, apply_transforms,
 };
@@ -49,6 +51,15 @@ use uuid::Uuid;
 pub struct RunConfig {
     /// Directory for logs, checkpoints, and artifacts.
     pub logs_root: PathBuf,
+    /// Working directory for tool commands (shell scripts).
+    ///
+    /// When set, `ToolHandler` uses this as `cwd` for shell commands instead
+    /// of `logs_root`.  This is critical for DOT pipelines whose tool_command
+    /// scripts (e.g. `grep READY_FOR_DESIGN docs/plans/brainstorm.md`) expect
+    /// to run relative to the project directory, not the temporary logs dir.
+    ///
+    /// When `None`, `ToolHandler` falls back to `logs_root` (legacy behaviour).
+    pub working_dir: Option<PathBuf>,
     /// Maximum number of node executions before the pipeline is forcibly
     /// terminated with a "max iterations exceeded" failure.
     ///
@@ -61,8 +72,18 @@ impl RunConfig {
     pub fn new(logs_root: impl Into<PathBuf>) -> Self {
         RunConfig {
             logs_root: logs_root.into(),
+            working_dir: None,
             max_iterations: 1000,
         }
+    }
+
+    /// Set the working directory for tool commands.
+    ///
+    /// When set, `ToolHandler` uses this as `cwd` for shell commands.
+    /// When `None` (default), `ToolHandler` falls back to `logs_root`.
+    pub fn with_working_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.working_dir = Some(dir.into());
+        self
     }
 
     /// Override the default maximum iteration limit.
@@ -122,6 +143,7 @@ impl PipelineRunner {
     /// Parse, transform, validate, and execute a pipeline from DOT source.
     pub async fn run(&self, dot_source: &str, config: RunConfig) -> Result<RunResult, EngineError> {
         let (graph, context) = self.prepare(dot_source, &config.logs_root).await?;
+        Self::seed_run_context(&context, &config);
         let node_outcomes: HashMap<String, Outcome> = HashMap::new();
         let node_retries: HashMap<String, u32> = HashMap::new();
         let completed_nodes: Vec<String> = vec![];
@@ -167,6 +189,10 @@ impl PipelineRunner {
         for entry in &cp.logs {
             context.append_log(entry);
         }
+
+        // ATR-BUG-001 fix: seed_run_context AFTER checkpoint restore so the
+        // live RunConfig's working_dir wins over any stale checkpoint value.
+        Self::seed_run_context(&context, &config);
 
         let completed_nodes = cp.completed_nodes.clone();
         let node_retries = cp.node_retries.clone();
@@ -258,6 +284,16 @@ impl PipelineRunner {
         Ok((graph, context))
     }
 
+    /// Store run-level configuration in the context so handlers can access it.
+    fn seed_run_context(context: &Context, config: &RunConfig) {
+        if let Some(ref wd) = config.working_dir {
+            context.set(
+                "_working_dir",
+                Value::Str(wd.to_string_lossy().to_string()),
+            );
+        }
+    }
+
     /// The main execution loop — shared between `run` and `resume`.
     #[allow(clippy::too_many_arguments)]
     #[allow(unused_assignments)]
@@ -274,6 +310,7 @@ impl PipelineRunner {
         let pipeline_start = Instant::now();
         let mut last_outcome = Outcome::success();
         let mut iteration_count: usize = 0;
+        let mut incoming_edge: Option<crate::graph::Edge> = None;
 
         loop {
             // SRV-BUG-002: guard against infinite loops.
@@ -328,6 +365,7 @@ impl PipelineRunner {
                     Ok(()) => break, // Clean pipeline exit.
                     Err(gate_id) => match resolve_gate_retry_target(&gate_id, &graph) {
                         Some(target) => {
+                            incoming_edge = None; // Reset: arrived via retry, not a real edge.
                             current_node_id = target.to_string();
                             continue;
                         }
@@ -342,6 +380,21 @@ impl PipelineRunner {
                     },
                 }
             }
+
+            // ----------------------------------------------------------------
+            // Step 1b: Resolve fidelity and build preamble
+            // ----------------------------------------------------------------
+            let fidelity_mode = resolve_fidelity(incoming_edge.as_ref(), &node, &graph);
+            let prev_node_id = completed_nodes.last().map(|s| s.as_str()).unwrap_or("");
+            let thread_key = resolve_thread_id(incoming_edge.as_ref(), &node, prev_node_id);
+            let preamble = build_preamble(
+                &fidelity_mode,
+                thread_key,
+                &context,
+                &completed_nodes,
+                &config.logs_root,
+            );
+            context.set("_preamble", Value::Str(preamble));
 
             // ----------------------------------------------------------------
             // Step 2: Execute handler with retry
@@ -399,6 +452,11 @@ impl PipelineRunner {
             // ----------------------------------------------------------------
             // Step 4: Apply context updates
             // ----------------------------------------------------------------
+            // ATR-BUG-002: Before applying updates, capture human gate
+            // responses into a running history so the compact preamble can
+            // include ALL human interactions, not just the most recent.
+            accumulate_human_history(&context, &outcome.context_updates, &current_node_id);
+
             context.apply_updates(&outcome.context_updates);
             context.set("outcome", Value::Str(outcome.status.as_str().to_string()));
             if !outcome.preferred_label.is_empty() {
@@ -433,12 +491,14 @@ impl PipelineRunner {
                 if outcome.status == StageStatus::Fail {
                     // Try node-level retry targets.
                     if !node.retry_target.is_empty() && graph.node(&node.retry_target).is_some() {
+                        incoming_edge = None; // Reset: arrived via retry, not a real edge.
                         current_node_id = node.retry_target.clone();
                         continue;
                     }
                     if !node.fallback_retry_target.is_empty()
                         && graph.node(&node.fallback_retry_target).is_some()
                     {
+                        incoming_edge = None; // Reset: arrived via retry, not a real edge.
                         current_node_id = node.fallback_retry_target.clone();
                         continue;
                     }
@@ -466,6 +526,7 @@ impl PipelineRunner {
             // ----------------------------------------------------------------
             // Step 8: Advance
             // ----------------------------------------------------------------
+            incoming_edge = Some(edge.clone());
             current_node_id = edge.to.clone();
         }
 
@@ -622,6 +683,85 @@ async fn write_node_status_json(
 }
 
 // ---------------------------------------------------------------------------
+// Helper: accumulate_human_history (ATR-BUG-002)
+// ---------------------------------------------------------------------------
+
+/// Maximum bytes for the `_human_interactions` history string.
+///
+/// Prevents unbounded growth in long-running pipelines with many human gates.
+/// When the history exceeds this limit, early entries are truncated from the
+/// front (same strategy as `build_full`).
+const HUMAN_HISTORY_MAX_BYTES: usize = 10_000;
+
+/// Append human gate interactions to a running `_human_interactions` history
+/// in the context.
+///
+/// When a handler's `context_updates` contains `human.gate.response` or
+/// `human.gate.label`, the value is appended as a new line to the
+/// `_human_interactions` key in context.  This allows the compact preamble
+/// to include ALL human gate responses from the entire pipeline run, not
+/// just the most recent one (which gets overwritten each time).
+///
+/// When the accumulated history exceeds [`HUMAN_HISTORY_MAX_BYTES`], early
+/// entries are truncated from the front.
+fn accumulate_human_history(
+    context: &Context,
+    updates: &HashMap<String, Value>,
+    node_id: &str,
+) {
+    let response = updates
+        .get("human.gate.response")
+        .and_then(|v| match v {
+            Value::Str(s) => Some(s.as_str()),
+            _ => None,
+        });
+    let label = updates
+        .get("human.gate.label")
+        .and_then(|v| match v {
+            Value::Str(s) => Some(s.as_str()),
+            _ => None,
+        });
+
+    // Nothing to accumulate if no human gate keys in this update.
+    if response.is_none() && label.is_none() {
+        return;
+    }
+
+    // Build a single history entry for this interaction.
+    let entry = match (label, response) {
+        (Some(lbl), Some(resp)) if !resp.is_empty() => {
+            format!("[{node_id}] chose \"{lbl}\": {resp}")
+        }
+        (Some(lbl), _) => format!("[{node_id}] chose \"{lbl}\""),
+        (_, Some(resp)) => format!("[{node_id}] responded: {resp}"),
+        _ => return,
+    };
+
+    // Append to existing history (newline-separated).
+    let existing = context.get_string("_human_interactions");
+    let mut updated = if existing.is_empty() {
+        entry
+    } else {
+        format!("{existing}\n{entry}")
+    };
+
+    // Cap growth: truncate from front when exceeding the limit.
+    if updated.len() > HUMAN_HISTORY_MAX_BYTES {
+        let target = updated.len() - HUMAN_HISTORY_MAX_BYTES;
+        let break_point = updated[target..]
+            .find('\n')
+            .map(|i| target + i + 1)
+            .unwrap_or(target);
+        updated = format!(
+            "[... earlier interactions truncated ...]\n{}",
+            &updated[break_point..]
+        );
+    }
+
+    context.set("_human_interactions", Value::Str(updated));
+}
+
+// ---------------------------------------------------------------------------
 // Helper: build_checkpoint
 // ---------------------------------------------------------------------------
 
@@ -674,6 +814,133 @@ mod tests {
     use crate::handler::CodergenHandler;
     use crate::testing::MockCodergenBackend;
     use std::sync::Arc;
+
+    // ---------------------------------------------------------------------------
+    // Unit tests for accumulate_human_history (ATR-BUG-002)
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn accumulate_human_history_label_and_response() {
+        let ctx = Context::new();
+        let mut updates = HashMap::new();
+        updates.insert(
+            "human.gate.label".to_string(),
+            Value::Str("approve".to_string()),
+        );
+        updates.insert(
+            "human.gate.response".to_string(),
+            Value::Str("looks good".to_string()),
+        );
+        accumulate_human_history(&ctx, &updates, "gate1");
+        let history = ctx.get_string("_human_interactions");
+        assert!(
+            history.contains("[gate1]"),
+            "must include node id; got: {history}"
+        );
+        assert!(
+            history.contains("approve"),
+            "must include label; got: {history}"
+        );
+        assert!(
+            history.contains("looks good"),
+            "must include response; got: {history}"
+        );
+    }
+
+    #[test]
+    fn accumulate_human_history_label_only() {
+        let ctx = Context::new();
+        let mut updates = HashMap::new();
+        updates.insert(
+            "human.gate.label".to_string(),
+            Value::Str("reject".to_string()),
+        );
+        accumulate_human_history(&ctx, &updates, "gate2");
+        let history = ctx.get_string("_human_interactions");
+        assert!(
+            history.contains("[gate2] chose \"reject\""),
+            "must format label-only entry; got: {history}"
+        );
+    }
+
+    #[test]
+    fn accumulate_human_history_response_only() {
+        let ctx = Context::new();
+        let mut updates = HashMap::new();
+        updates.insert(
+            "human.gate.response".to_string(),
+            Value::Str("free text answer".to_string()),
+        );
+        accumulate_human_history(&ctx, &updates, "freeform1");
+        let history = ctx.get_string("_human_interactions");
+        assert!(
+            history.contains("[freeform1] responded: free text answer"),
+            "must format response-only entry; got: {history}"
+        );
+    }
+
+    #[test]
+    fn accumulate_human_history_no_human_keys_is_noop() {
+        let ctx = Context::new();
+        let mut updates = HashMap::new();
+        updates.insert("tool.output".to_string(), Value::Str("data".to_string()));
+        accumulate_human_history(&ctx, &updates, "tool_node");
+        assert!(
+            ctx.get("_human_interactions").is_none(),
+            "must not create history for non-human updates"
+        );
+    }
+
+    #[test]
+    fn accumulate_human_history_appends_multiple() {
+        let ctx = Context::new();
+        let mut u1 = HashMap::new();
+        u1.insert(
+            "human.gate.label".to_string(),
+            Value::Str("approve".to_string()),
+        );
+        accumulate_human_history(&ctx, &u1, "gate1");
+
+        let mut u2 = HashMap::new();
+        u2.insert(
+            "human.gate.response".to_string(),
+            Value::Str("detailed feedback".to_string()),
+        );
+        accumulate_human_history(&ctx, &u2, "gate2");
+
+        let history = ctx.get_string("_human_interactions");
+        assert!(history.contains("[gate1]"), "must include gate1");
+        assert!(history.contains("[gate2]"), "must include gate2");
+        assert!(
+            history.contains('\n'),
+            "entries must be newline-separated; got: {history}"
+        );
+    }
+
+    #[test]
+    fn accumulate_human_history_caps_growth() {
+        let ctx = Context::new();
+        // Accumulate enough entries to exceed the 10KB cap.
+        for i in 0..500 {
+            let mut updates = HashMap::new();
+            updates.insert(
+                "human.gate.response".to_string(),
+                Value::Str(format!("Response number {i} with padding text to grow")),
+            );
+            accumulate_human_history(&ctx, &updates, &format!("gate_{i}"));
+        }
+        let history = ctx.get_string("_human_interactions");
+        assert!(
+            history.len() <= HUMAN_HISTORY_MAX_BYTES + 200, // some slack for truncation marker
+            "history must be capped; got {} bytes",
+            history.len()
+        );
+        assert!(
+            history.contains("[... earlier interactions truncated ...]"),
+            "must include truncation marker; got first 100 chars: {}",
+            &history[..100.min(history.len())]
+        );
+    }
 
     // ---------------------------------------------------------------------------
     // Test helper: build a simple linear DOT pipeline
@@ -975,9 +1242,15 @@ digraph test {
         runner.run(dot, RunConfig::new(dir.path())).await.unwrap();
 
         // Check the prompt file was written with expanded variable.
+        // The engine now prepends the preamble (fidelity-aware context) before
+        // the prompt, separated by "---".  The expanded $goal must appear in the
+        // prompt portion after the separator.
         let prompt_path = dir.path().join("plan").join("prompt.md");
         let prompt_text = std::fs::read_to_string(prompt_path).unwrap();
-        assert_eq!(prompt_text, "Work on: build a rocket");
+        assert!(
+            prompt_text.contains("Work on: build a rocket"),
+            "prompt must contain the expanded $goal; got: {prompt_text}"
+        );
     }
 
     // ---------------------------------------------------------------------------
@@ -1243,6 +1516,47 @@ digraph test {
         assert!(
             result.completed_nodes.contains(&"echo_task".to_string()),
             "tool node must be in completed_nodes"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // ATR-BUG-001: RunConfig.working_dir flows to ToolHandler e2e
+    // ---------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn tool_node_uses_working_dir_from_run_config() {
+        // ATR-BUG-001: ToolHandler must use RunConfig.working_dir as cwd
+        // for shell commands, NOT logs_root.  This test creates a marker
+        // file in a separate working directory and verifies that `cat marker.txt`
+        // succeeds (it would fail if the tool ran in logs_root).
+        let logs_dir = tempfile::tempdir().unwrap();
+        let work_dir = tempfile::tempdir().unwrap();
+
+        // Marker file only exists in work_dir, NOT in logs_dir.
+        std::fs::write(work_dir.path().join("marker.txt"), "ATR-BUG-001-fixed").unwrap();
+
+        let dot = r#"
+digraph test {
+    graph [goal="working dir test"]
+    start [shape=Mdiamond]
+    exit  [shape=Msquare]
+    check [shape=parallelogram, tool_command="cat marker.txt"]
+    start -> check -> exit
+}
+"#;
+        let (runner, _rx) = PipelineRunner::builder().build();
+        let config = RunConfig::new(logs_dir.path()).with_working_dir(work_dir.path());
+        let result = runner.run(dot, config).await.unwrap();
+
+        assert_eq!(
+            result.status,
+            StageStatus::Success,
+            "tool must succeed when working_dir contains the file"
+        );
+        assert_eq!(
+            result.context.get_string("tool.output"),
+            "ATR-BUG-001-fixed",
+            "tool stdout must contain marker file content from working_dir"
         );
     }
 

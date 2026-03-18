@@ -1,6 +1,6 @@
 //! Codergen handler — the primary LLM task handler for `shape=box` nodes.
 //!
-//! Builds a prompt (expanding `$goal` and context variables), calls a pluggable [`CodergenBackend`],
+//! Builds a prompt (expanding `$goal`), calls a pluggable [`CodergenBackend`],
 //! writes `prompt.md` / `response.md` / `status.json` to the stage log
 //! directory, and returns an [`Outcome`].
 
@@ -84,17 +84,30 @@ impl Handler for CodergenHandler {
         };
         let prompt = expand_variables(&raw_prompt, graph, context);
 
+        // 1b. Prepend preamble if present.
+        // The *original* prompt (without preamble) is written to prompt.md so that
+        // `build_full()` does not re-read prior preambles, avoiding O(n²) transcript
+        // inflation.  The augmented prompt (with preamble) is sent to the backend only.
+        let augmented_prompt = {
+            let preamble = context.get_string("_preamble");
+            if preamble.is_empty() {
+                prompt.clone()
+            } else {
+                format!("{preamble}\n---\n{prompt}")
+            }
+        };
+
         // 2. Create stage directory.
         let stage_dir = logs_root.join(&node.id);
         fs::create_dir_all(&stage_dir).await?;
 
-        // 3. Write prompt.md.
+        // 3. Write prompt.md (original prompt, without preamble).
         fs::write(stage_dir.join("prompt.md"), &prompt).await?;
 
-        // 4. Call backend (or simulate).
+        // 4. Call backend (or simulate) with augmented prompt.
         let response_text: String;
         if let Some(backend) = &self.backend {
-            match backend.run(node, &prompt, context).await {
+            match backend.run(node, &augmented_prompt, context).await {
                 Ok(CodergenResult::Outcome(outcome)) => {
                     // Backend returned a full outcome.
                     // NLSpec §11.6: response.md must be written unconditionally.
@@ -124,7 +137,7 @@ impl Handler for CodergenHandler {
         fs::write(stage_dir.join("response.md"), &response_text).await?;
 
         // 6. Build outcome.
-        let truncated_response: String = response_text.chars().take(5000).collect();
+        let truncated_response: String = response_text.chars().take(200).collect();
         let mut context_updates = std::collections::HashMap::new();
         context_updates.insert("last_stage".to_string(), Value::Str(node.id.clone()));
         context_updates.insert("last_response".to_string(), Value::Str(truncated_response));
@@ -146,33 +159,12 @@ impl Handler for CodergenHandler {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Expand `$goal` and all context keys in `prompt`.
+/// Expand `$goal` in `prompt`.
 ///
-/// Substitution order:
-/// 1. `$goal` -> graph-level goal attribute
-/// 2. For each key in the context snapshot, `$key` -> value string
-///
-/// Keys are sorted longest-first so `$task_details` is replaced before `$task`
-/// (prevents partial matches from eating longer key names).
-pub fn expand_variables(prompt: &str, graph: &Graph, context: &Context) -> String {
-    // Note: if context contains a "goal" key, the graph-level $goal takes precedence
-    // because it is substituted first and $goal will not appear in `result` for the
-    // context loop to match.
-    let mut result = prompt.replace("$goal", &graph.graph_attrs.goal);
-
-    // Collect context keys and sort longest-first to prevent partial replacement.
-    let snapshot = context.snapshot();
-    let mut keys: Vec<&String> = snapshot.keys().collect();
-    keys.sort_by_key(|k| std::cmp::Reverse(k.len()));
-
-    for key in keys {
-        let placeholder = format!("${}", key);
-        if result.contains(&placeholder) {
-            result = result.replace(&placeholder, &snapshot[key].to_string_repr());
-        }
-    }
-
-    result
+/// `$goal` is the only built-in template variable.  Context values reach LLMs
+/// via the Preamble Transform, not template substitution.
+pub fn expand_variables(prompt: &str, graph: &Graph, _context: &Context) -> String {
+    prompt.replace("$goal", &graph.graph_attrs.goal)
 }
 
 /// Serialise `outcome` to pretty JSON and write to `{stage_dir}/status.json`.
@@ -198,6 +190,7 @@ mod tests {
     use super::*;
     use crate::graph::{Graph, GraphAttrs};
     use crate::state::context::StageStatus;
+    use std::sync::Arc;
 
     struct MockTextBackend {
         response: String,
@@ -460,9 +453,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn last_response_stored_up_to_5000_chars() {
+    async fn last_response_stored_up_to_200_chars() {
         let dir = tempfile::tempdir().unwrap();
-        let long_response = "A".repeat(6000);
+        let long_response = "A".repeat(300);
         let backend = MockTextBackend {
             response: long_response,
         };
@@ -475,11 +468,7 @@ mod tests {
             .await
             .unwrap();
         if let Some(Value::Str(s)) = outcome.context_updates.get("last_response") {
-            assert_eq!(
-                s.len(),
-                5000,
-                "last_response must truncate at 5000 chars, not 200"
-            );
+            assert_eq!(s.len(), 200, "last_response must truncate at 200 chars");
         } else {
             panic!("last_response not found or wrong type");
         }
@@ -532,43 +521,133 @@ mod tests {
     }
 
     #[test]
-    fn expand_variables_replaces_context_key() {
+    fn expand_variables_does_not_expand_context_keys() {
         let ctx = Context::new();
         ctx.set(
             "human.gate.response",
             Value::Str("user said hello".to_string()),
         );
         let graph = make_graph("my goal");
+        // Context keys must NOT be expanded — they reach LLMs via Preamble Transform only
         let result = expand_variables("Feedback: $human.gate.response", &graph, &ctx);
-        assert_eq!(result, "Feedback: user said hello");
+        assert_eq!(result, "Feedback: $human.gate.response");
     }
 
-    #[test]
-    fn expand_variables_replaces_multiple_context_keys() {
+    // -----------------------------------------------------------------------
+    // Preamble prepending tests (PREAMBLE-014)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn preamble_prepended_to_backend_call_not_prompt_md() {
+        // prompt.md must contain the ORIGINAL prompt (no preamble) to avoid
+        // O(n²) transcript inflation when build_full() reads it back.
+        // The augmented prompt (with preamble) is sent to the backend only.
+        use std::sync::Mutex;
+
+        struct PromptCapturingBackend {
+            captured: Arc<Mutex<Option<String>>>,
+        }
+
+        #[async_trait]
+        impl CodergenBackend for PromptCapturingBackend {
+            async fn run(
+                &self,
+                _node: &Node,
+                prompt: &str,
+                _context: &Context,
+            ) -> Result<CodergenResult, EngineError> {
+                *self.captured.lock().unwrap() = Some(prompt.to_string());
+                Ok(CodergenResult::Text("done".to_string()))
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let captured = Arc::new(Mutex::new(None::<String>));
+        let backend = PromptCapturingBackend {
+            captured: captured.clone(),
+        };
+        let handler = CodergenHandler::new(Some(Box::new(backend)));
+        let node = make_node("step", "Do the work for: $goal");
         let ctx = Context::new();
-        ctx.set("task", Value::Str("build a rocket".to_string()));
-        ctx.set("last_response", Value::Str("draft done".to_string()));
-        let graph = make_graph("goal");
-        let result = expand_variables("Task: $task, Previous: $last_response", &graph, &ctx);
-        assert_eq!(result, "Task: build a rocket, Previous: draft done");
+        ctx.set(
+            "_preamble",
+            Value::Str("## Pipeline Context\nGoal: build a rocket".to_string()),
+        );
+        let graph = make_graph("build a rocket");
+        handler
+            .execute(&node, &ctx, &graph, dir.path())
+            .await
+            .unwrap();
+
+        // prompt.md must contain the ORIGINAL prompt (no preamble).
+        let prompt_text =
+            std::fs::read_to_string(dir.path().join("step").join("prompt.md")).unwrap();
+        assert_eq!(
+            prompt_text, "Do the work for: build a rocket",
+            "prompt.md must contain original prompt without preamble; got: {prompt_text}"
+        );
+
+        // The backend must receive the AUGMENTED prompt (with preamble).
+        let backend_prompt = captured.lock().unwrap().clone().unwrap();
+        assert!(
+            backend_prompt.starts_with("## Pipeline Context"),
+            "backend must receive preamble-augmented prompt; got: {backend_prompt}"
+        );
+        assert!(
+            backend_prompt.contains("---"),
+            "preamble and prompt must be separated by ---; got: {backend_prompt}"
+        );
+        assert!(
+            backend_prompt.contains("Do the work for: build a rocket"),
+            "original prompt must appear after separator; got: {backend_prompt}"
+        );
     }
 
-    #[test]
-    fn expand_variables_ignores_unknown_dollar_signs() {
+    #[tokio::test]
+    async fn no_preamble_prompt_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = MockTextBackend {
+            response: "done".to_string(),
+        };
+        let handler = CodergenHandler::new(Some(Box::new(backend)));
+        let node = make_node("step", "Do the work");
         let ctx = Context::new();
-        ctx.set("known", Value::Str("yes".to_string()));
+        // No _preamble set
         let graph = make_graph("goal");
-        let result = expand_variables("$known and $unknown_var", &graph, &ctx);
-        assert_eq!(result, "yes and $unknown_var");
+        handler
+            .execute(&node, &ctx, &graph, dir.path())
+            .await
+            .unwrap();
+
+        let prompt_text =
+            std::fs::read_to_string(dir.path().join("step").join("prompt.md")).unwrap();
+        assert_eq!(
+            prompt_text, "Do the work",
+            "prompt must be unchanged when no _preamble is set"
+        );
     }
 
-    #[test]
-    fn expand_variables_longer_keys_replaced_before_shorter() {
+    #[tokio::test]
+    async fn empty_preamble_prompt_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = MockTextBackend {
+            response: "done".to_string(),
+        };
+        let handler = CodergenHandler::new(Some(Box::new(backend)));
+        let node = make_node("step", "Do the work");
         let ctx = Context::new();
-        ctx.set("task", Value::Str("A".to_string()));
-        ctx.set("task_details", Value::Str("B".to_string()));
+        ctx.set("_preamble", Value::Str(String::new()));
         let graph = make_graph("goal");
-        let result = expand_variables("$task_details then $task", &graph, &ctx);
-        assert_eq!(result, "B then A");
+        handler
+            .execute(&node, &ctx, &graph, dir.path())
+            .await
+            .unwrap();
+
+        let prompt_text =
+            std::fs::read_to_string(dir.path().join("step").join("prompt.md")).unwrap();
+        assert_eq!(
+            prompt_text, "Do the work",
+            "prompt must be unchanged when _preamble is empty"
+        );
     }
 }
