@@ -1,39 +1,43 @@
 [package]
 name = "attractor"
 version = "0.1.0"
-edition.workspace = true
-rust-version.workspace = true
+edition = "2024"
+rust-version = "1.85"
 description = "DOT-based AI pipeline runner"
-license.workspace = true
+license = "MIT"
 repository = "https://github.com/bkrabach/attractor"
 readme = "README.md"
 keywords = ["pipeline", "workflow", "ai", "llm", "graph"]
 categories = ["development-tools", "asynchronous"]
 
 [dependencies]
-unified-llm       = { workspace = true }
-coding-agent-loop = { workspace = true }
-tokio        = { workspace = true }
-serde        = { workspace = true }
-serde_json   = { workspace = true }
-async-trait  = { workspace = true }
-futures      = { workspace = true }
-thiserror    = { workspace = true }
-chrono       = { workspace = true }
-uuid         = { workspace = true }
-tracing      = { workspace = true }
-tokio-util   = { workspace = true }
-nom          = { workspace = true }
-indexmap     = { workspace = true }
-clap         = { workspace = true }
-tracing-subscriber = { workspace = true }
-regex        = { workspace = true }
+# Local workspace crates — NOTE: standalone needs path refs or must be published to crates.io
+# For standalone builds, ensure these are available as sibling directories or update to published versions
+tokio        = { version = "1",    features = ["rt-multi-thread", "macros", "time", "fs", "process", "io-util", "io-std"] }
+serde        = { version = "1",    features = ["derive"] }
+serde_json   = "1"
+async-trait  = "0.1"
+futures      = "0.3"
+thiserror    = "2"
+chrono       = { version = "0.4", features = ["serde"] }
+uuid         = { version = "1", features = ["v4"] }
+tracing      = "0.1"
+tokio-util   = { version = "0.7" }
+nom          = "8"
+indexmap     = { version = "2", features = ["serde"] }
+clap         = { version = "4",   features = ["derive"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+regex        = "1"
+
+# Workspace crates — update paths as needed for standalone builds
+unified-llm       = { path = "../unified-llm" }
+coding-agent-loop = { path = "../coding-agent-loop" }
 
 [dev-dependencies]
-tokio    = { workspace = true, features = ["rt-multi-thread", "macros"] }
-anyhow   = { workspace = true }
-proptest = { workspace = true }
-tempfile = { workspace = true }
+tokio    = { version = "1", features = ["rt-multi-thread", "macros"] }
+anyhow   = "1"
+proptest = "1"
+tempfile = "3"
 
 [[bin]]
 name = "attractor"

@@ -113,25 +113,19 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "base64",
  "chrono",
  "clap",
  "coding-agent-loop",
  "futures",
- "globset",
  "indexmap",
  "nom",
  "proptest",
- "rand",
  "regex",
- "reqwest",
  "serde",
  "serde_json",
- "sha2",
  "tempfile",
  "thiserror",
  "tokio",
- "tokio-stream",
  "tokio-util",
  "tracing",
  "tracing-subscriber",
@@ -1786,7 +1780,6 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
  "tokio",
- "tokio-util",
 ]
 
 [[package]]
