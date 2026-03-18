@@ -82,8 +82,7 @@ impl Handler for WaitForHumanHandler {
 
             match &answer.value {
                 AnswerValue::Timeout => {
-                    if let Some(Value::Str(default_choice)) =
-                        node.extra.get("human.default_choice")
+                    if let Some(Value::Str(default_choice)) = node.extra.get("human.default_choice")
                     {
                         let preferred = default_choice.clone();
                         let outcome = build_freeform_outcome(&preferred, &edges, "");
@@ -386,7 +385,7 @@ mod tests {
     use super::*;
     use crate::graph::{Edge, Graph, Node};
     use crate::interviewer::{
-        Answer, AnswerValue, AutoApproveInterviewer, QueueInterviewer, QuestionType,
+        Answer, AnswerValue, AutoApproveInterviewer, QuestionType, QueueInterviewer,
         RecordingInterviewer,
     };
     use crate::state::context::StageStatus;
@@ -578,7 +577,8 @@ mod tests {
         node.id = node_id.to_string();
         node.label = "Brainstorm with Human".to_string();
         node.shape = "hexagon".to_string();
-        node.extra.insert("mode".to_string(), Value::Str("freeform".to_string()));
+        node.extra
+            .insert("mode".to_string(), Value::Str("freeform".to_string()));
         g.nodes.insert(node_id.to_string(), node.clone());
 
         let mut target = Node::default();
@@ -653,7 +653,9 @@ mod tests {
         );
 
         assert!(
-            outcome.suggested_next_ids.contains(&"next_node".to_string()),
+            outcome
+                .suggested_next_ids
+                .contains(&"next_node".to_string()),
             "freeform mode must route to the outgoing edge target"
         );
     }

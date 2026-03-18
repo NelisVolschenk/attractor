@@ -104,8 +104,9 @@ pub use handler::{
 
 // Interviewer
 pub use interviewer::{
-    Answer, AnswerValue, AutoApproveInterviewer, CallbackInterviewer, Interviewer, Question,
-    QuestionOption, QuestionType, QueueInterviewer, Recording, RecordingInterviewer,
+    Answer, AnswerValue, AutoApproveInterviewer, CallbackInterviewer, ConsoleInterviewer,
+    Interviewer, Question, QuestionOption, QuestionType, QueueInterviewer, Recording,
+    RecordingInterviewer,
 };
 
 // Events

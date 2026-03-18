@@ -1,6 +1,6 @@
 //! Codergen handler — the primary LLM task handler for `shape=box` nodes.
 //!
-//! Builds a prompt (expanding `$goal`), calls a pluggable [`CodergenBackend`],
+//! Builds a prompt (expanding `$goal` and context variables), calls a pluggable [`CodergenBackend`],
 //! writes `prompt.md` / `response.md` / `status.json` to the stage log
 //! directory, and returns an [`Outcome`].
 
@@ -124,7 +124,7 @@ impl Handler for CodergenHandler {
         fs::write(stage_dir.join("response.md"), &response_text).await?;
 
         // 6. Build outcome.
-        let truncated_response: String = response_text.chars().take(200).collect();
+        let truncated_response: String = response_text.chars().take(5000).collect();
         let mut context_updates = std::collections::HashMap::new();
         context_updates.insert("last_stage".to_string(), Value::Str(node.id.clone()));
         context_updates.insert("last_response".to_string(), Value::Str(truncated_response));
@@ -146,9 +146,33 @@ impl Handler for CodergenHandler {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Expand `$goal` in `prompt` with the graph-level goal attribute.
-pub fn expand_variables(prompt: &str, graph: &Graph, _context: &Context) -> String {
-    prompt.replace("$goal", &graph.graph_attrs.goal)
+/// Expand `$goal` and all context keys in `prompt`.
+///
+/// Substitution order:
+/// 1. `$goal` -> graph-level goal attribute
+/// 2. For each key in the context snapshot, `$key` -> value string
+///
+/// Keys are sorted longest-first so `$task_details` is replaced before `$task`
+/// (prevents partial matches from eating longer key names).
+pub fn expand_variables(prompt: &str, graph: &Graph, context: &Context) -> String {
+    // Note: if context contains a "goal" key, the graph-level $goal takes precedence
+    // because it is substituted first and $goal will not appear in `result` for the
+    // context loop to match.
+    let mut result = prompt.replace("$goal", &graph.graph_attrs.goal);
+
+    // Collect context keys and sort longest-first to prevent partial replacement.
+    let snapshot = context.snapshot();
+    let mut keys: Vec<&String> = snapshot.keys().collect();
+    keys.sort_by_key(|k| std::cmp::Reverse(k.len()));
+
+    for key in keys {
+        let placeholder = format!("${}", key);
+        if result.contains(&placeholder) {
+            result = result.replace(&placeholder, &snapshot[key].to_string_repr());
+        }
+    }
+
+    result
 }
 
 /// Serialise `outcome` to pretty JSON and write to `{stage_dir}/status.json`.
@@ -436,9 +460,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn last_response_truncated_at_200_chars() {
+    async fn last_response_stored_up_to_5000_chars() {
         let dir = tempfile::tempdir().unwrap();
-        let long_response = "A".repeat(500);
+        let long_response = "A".repeat(6000);
         let backend = MockTextBackend {
             response: long_response,
         };
@@ -451,10 +475,36 @@ mod tests {
             .await
             .unwrap();
         if let Some(Value::Str(s)) = outcome.context_updates.get("last_response") {
-            assert_eq!(s.len(), 200);
+            assert_eq!(
+                s.len(),
+                5000,
+                "last_response must truncate at 5000 chars, not 200"
+            );
         } else {
             panic!("last_response not found or wrong type");
         }
+    }
+
+    #[tokio::test]
+    async fn last_response_not_truncated_when_short() {
+        let dir = tempfile::tempdir().unwrap();
+        let short_response = "Hello world".to_string();
+        let backend = MockTextBackend {
+            response: short_response.clone(),
+        };
+        let handler = CodergenHandler::new(Some(Box::new(backend)));
+        let node = make_node("n", "p");
+        let ctx = Context::new();
+        let graph = make_graph("g");
+        let outcome = handler
+            .execute(&node, &ctx, &graph, dir.path())
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.context_updates.get("last_response"),
+            Some(&Value::Str(short_response)),
+            "short responses must be stored in full"
+        );
     }
 
     #[test]
@@ -479,5 +529,46 @@ mod tests {
         let graph = make_graph("X");
         let result = expand_variables("no variable here", &graph, &ctx);
         assert_eq!(result, "no variable here");
+    }
+
+    #[test]
+    fn expand_variables_replaces_context_key() {
+        let ctx = Context::new();
+        ctx.set(
+            "human.gate.response",
+            Value::Str("user said hello".to_string()),
+        );
+        let graph = make_graph("my goal");
+        let result = expand_variables("Feedback: $human.gate.response", &graph, &ctx);
+        assert_eq!(result, "Feedback: user said hello");
+    }
+
+    #[test]
+    fn expand_variables_replaces_multiple_context_keys() {
+        let ctx = Context::new();
+        ctx.set("task", Value::Str("build a rocket".to_string()));
+        ctx.set("last_response", Value::Str("draft done".to_string()));
+        let graph = make_graph("goal");
+        let result = expand_variables("Task: $task, Previous: $last_response", &graph, &ctx);
+        assert_eq!(result, "Task: build a rocket, Previous: draft done");
+    }
+
+    #[test]
+    fn expand_variables_ignores_unknown_dollar_signs() {
+        let ctx = Context::new();
+        ctx.set("known", Value::Str("yes".to_string()));
+        let graph = make_graph("goal");
+        let result = expand_variables("$known and $unknown_var", &graph, &ctx);
+        assert_eq!(result, "yes and $unknown_var");
+    }
+
+    #[test]
+    fn expand_variables_longer_keys_replaced_before_shorter() {
+        let ctx = Context::new();
+        ctx.set("task", Value::Str("A".to_string()));
+        ctx.set("task_details", Value::Str("B".to_string()));
+        let graph = make_graph("goal");
+        let result = expand_variables("$task_details then $task", &graph, &ctx);
+        assert_eq!(result, "B then A");
     }
 }

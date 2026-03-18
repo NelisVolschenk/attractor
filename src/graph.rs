@@ -126,6 +126,8 @@ pub struct GraphAttrs {
     pub fallback_retry_target: String,
     /// Default context fidelity mode (e.g., `"compact"`).
     pub default_fidelity: String,
+    /// Default thread ID for `full` fidelity sessions.
+    pub default_thread_id: String,
     /// Unknown / extra graph-level attributes.
     #[serde(default)]
     pub extra: HashMap<String, Value>,
@@ -151,7 +153,12 @@ impl GraphAttrs {
                 }
                 "retry_target" => ga.retry_target = val.to_string_repr(),
                 "fallback_retry_target" => ga.fallback_retry_target = val.to_string_repr(),
-                "default_fidelity" => ga.default_fidelity = val.to_string_repr(),
+                "default_fidelity" | "context_fidelity_default" => {
+                    ga.default_fidelity = val.to_string_repr()
+                }
+                "default_thread_id" | "context_thread_default" => {
+                    ga.default_thread_id = val.to_string_repr()
+                }
                 _ => {
                     extra.insert(key, val);
                 }
@@ -620,5 +627,44 @@ mod tests {
             n.allow_partial,
             "allow_partial=\"true\" must set allow_partial=true"
         );
+    }
+
+    #[test]
+    fn parse_context_fidelity_default_alias() {
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "context_fidelity_default".to_string(),
+            Value::Str("truncate".to_string()),
+        );
+        let ga = GraphAttrs::from_attrs(attrs);
+        assert_eq!(
+            ga.default_fidelity, "truncate",
+            "context_fidelity_default must map to default_fidelity field"
+        );
+    }
+
+    #[test]
+    fn parse_context_thread_default() {
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "context_thread_default".to_string(),
+            Value::Str("my-thread".to_string()),
+        );
+        let ga = GraphAttrs::from_attrs(attrs);
+        assert_eq!(
+            ga.default_thread_id, "my-thread",
+            "context_thread_default must map to default_thread_id field"
+        );
+    }
+
+    #[test]
+    fn both_fidelity_alias_and_canonical_work() {
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "default_fidelity".to_string(),
+            Value::Str("compact".to_string()),
+        );
+        let ga = GraphAttrs::from_attrs(attrs);
+        assert_eq!(ga.default_fidelity, "compact");
     }
 }

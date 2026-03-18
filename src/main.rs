@@ -21,6 +21,7 @@ use attractor::events::PipelineEvent;
 use attractor::graph::Node;
 use attractor::handler::{CodergenBackend, CodergenHandler, CodergenResult};
 use attractor::state::context::Context;
+use regex::Regex;
 use unified_llm::{Client, GenerateParams, generate};
 
 // ---------------------------------------------------------------------------
@@ -99,7 +100,7 @@ impl CodergenBackend for LlmCodergenBackend {
         &self,
         node: &Node,
         prompt: &str,
-        _ctx: &Context,
+        ctx: &Context,
     ) -> Result<CodergenResult, EngineError> {
         // Honour the per-node model if the stylesheet/DOT set one.
         let model = if !node.llm_model.is_empty() {
@@ -108,7 +109,12 @@ impl CodergenBackend for LlmCodergenBackend {
             self.default_model.clone()
         };
 
-        let mut params = GenerateParams::new(model, prompt);
+        // Prepend any available pipeline context (human feedback, prior step
+        // output, prior step name) so the LLM has multi-turn awareness.
+        let context_prefix = build_context_prefix(ctx);
+        let full_prompt = format!("{context_prefix}{prompt}");
+
+        let mut params = GenerateParams::new(model, &full_prompt);
         params.client = Some(self.client.clone());
 
         // Route to the node's explicit provider when specified.
@@ -128,6 +134,43 @@ impl CodergenBackend for LlmCodergenBackend {
 }
 
 // ---------------------------------------------------------------------------
+// Context prefix helper
+// ---------------------------------------------------------------------------
+
+/// Pipeline context key: human gate answer from a previous approval step.
+const CTX_HUMAN_RESPONSE: &str = "human.gate.response";
+
+/// Pipeline context key: text output produced by the most recent stage.
+const CTX_LAST_RESPONSE: &str = "last_response";
+
+/// Pipeline context key: name of the most recently completed stage.
+const CTX_LAST_STAGE: &str = "last_stage";
+
+/// Build a context prefix string from relevant pipeline context keys.
+///
+/// If any of `human.gate.response`, `last_response`, or `last_stage` are
+/// present in the context, they are formatted into a `[Pipeline Context]`
+/// header block that can be prepended to an LLM prompt.  Returns an empty
+/// string when none of the keys are set.
+fn build_context_prefix(ctx: &Context) -> String {
+    let mut sections = Vec::new();
+    if let Some(val) = ctx.get(CTX_HUMAN_RESPONSE) {
+        sections.push(format!("Human feedback: {}", val.to_string_repr()));
+    }
+    if let Some(val) = ctx.get(CTX_LAST_RESPONSE) {
+        sections.push(format!("Previous step output: {}", val.to_string_repr()));
+    }
+    if let Some(val) = ctx.get(CTX_LAST_STAGE) {
+        sections.push(format!("Previous step: {}", val.to_string_repr()));
+    }
+    if sections.is_empty() {
+        String::new()
+    } else {
+        format!("[Pipeline Context]\n{}\n\n", sections.join("\n"))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Goal injection helper
 // ---------------------------------------------------------------------------
 
@@ -138,13 +181,15 @@ impl CodergenBackend for LlmCodergenBackend {
 /// first `graph [...]` block.  If no such block exists the source is returned
 /// unchanged (the engine will use an empty goal).
 pub fn inject_goal(dot: &str, goal: &str) -> String {
-    use regex::Regex;
+    // Escape `$` so it is never treated as a capture-group backreference by
+    // the regex engine's replacement-string parser (`$$` → literal `$`).
+    let safe_goal = goal.replace('$', "$$");
 
     // Replace an existing goal value.
     let re_existing = Regex::new(r#"(?i)(goal\s*=\s*")([^"]*)(")"#).expect("valid regex");
     if re_existing.is_match(dot) {
         return re_existing
-            .replace(dot, format!(r#"${{1}}{goal}${{3}}"#))
+            .replace(dot, format!(r#"${{1}}{safe_goal}${{3}}"#))
             .into_owned();
     }
 
@@ -152,7 +197,7 @@ pub fn inject_goal(dot: &str, goal: &str) -> String {
     let re_graph_bracket = Regex::new(r#"(?i)(graph\s*\[)"#).expect("valid regex");
     if re_graph_bracket.is_match(dot) {
         return re_graph_bracket
-            .replace(dot, format!(r#"${{1}}goal="{goal}", "#))
+            .replace(dot, format!(r#"${{1}}goal="{safe_goal}", "#))
             .into_owned();
     }
 
@@ -303,6 +348,7 @@ pub async fn run_pipeline(
     let codergen = Arc::new(CodergenHandler::new(Some(backend)));
     let (runner, mut events) = PipelineRunner::builder()
         .with_handler("codergen", codergen)
+        .with_interviewer(Arc::new(attractor::interviewer::ConsoleInterviewer))
         .build();
 
     // Resolve logs directory.
@@ -386,6 +432,8 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use attractor::graph::Value;
+    use attractor::state::context::Context;
     use clap::Parser;
 
     // ── Cli defaults ──────────────────────────────────────────────────────
@@ -484,6 +532,98 @@ mod tests {
         let patched = inject_goal(dot, "my goal");
         // No graph [] block — source returned unchanged.
         assert_eq!(patched, dot);
+    }
+
+    #[test]
+    fn inject_goal_dollar_sign_in_goal_is_literal() {
+        // Regression: `$` in a regex replacement string is interpreted as a
+        // capture-group backreference.  "fix $1 issue" must appear verbatim.
+        let dot = r#"digraph { graph [goal="old"] start [shape=Mdiamond] }"#;
+        let patched = inject_goal(dot, "fix $1 issue");
+        assert!(
+            patched.contains(r#"goal="fix $1 issue""#),
+            "$ in goal must be treated as literal; got: {patched}"
+        );
+    }
+
+    #[test]
+    fn inject_goal_dollar_sign_in_goal_insert_branch() {
+        // Regression guard for the INSERT path: no existing goal= attribute,
+        // so inject_goal uses the re_graph_bracket branch.  `$` in the
+        // replacement must still be treated as a literal character.
+        let dot = r#"digraph { graph [label="pipeline"] start [shape=Mdiamond] }"#;
+        let patched = inject_goal(dot, "cost $5 per run");
+        assert!(
+            patched.contains(r#"goal="cost $5 per run""#),
+            "$ in goal must be literal on the insert path; got: {patched}"
+        );
+    }
+
+    // ── ConsoleInterviewer trait-bound ─────────────────────────────────────────────
+
+    // ── build_context_prefix ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn context_prefix_includes_human_response() {
+        let ctx = Context::new();
+        ctx.set(
+            "human.gate.response",
+            Value::Str("I want option B".to_string()),
+        );
+        let prefix = build_context_prefix(&ctx);
+        assert!(prefix.contains("[Pipeline Context]"));
+        assert!(prefix.contains("Human feedback: I want option B"));
+    }
+
+    #[test]
+    fn context_prefix_includes_last_response() {
+        let ctx = Context::new();
+        ctx.set("last_response", Value::Str("step 1 output".to_string()));
+        ctx.set("last_stage", Value::Str("ExploreIdea".to_string()));
+        let prefix = build_context_prefix(&ctx);
+        assert!(prefix.contains("Previous step output: step 1 output"));
+        assert!(prefix.contains("Previous step: ExploreIdea"));
+    }
+
+    #[test]
+    fn context_prefix_all_three_keys_ordering() {
+        // Verifies that when all three keys are present the output order is:
+        // human feedback first, then previous step output, then previous step.
+        let ctx = Context::new();
+        ctx.set("human.gate.response", Value::Str("approve it".to_string()));
+        ctx.set("last_response", Value::Str("generated code".to_string()));
+        ctx.set("last_stage", Value::Str("CodeGen".to_string()));
+        let prefix = build_context_prefix(&ctx);
+        assert!(prefix.contains("[Pipeline Context]"));
+        let human_pos = prefix
+            .find("Human feedback:")
+            .expect("human feedback present");
+        let output_pos = prefix
+            .find("Previous step output:")
+            .expect("step output present");
+        let stage_pos = prefix.find("Previous step:").expect("step name present");
+        assert!(
+            human_pos < output_pos,
+            "human feedback must come before step output"
+        );
+        assert!(
+            output_pos < stage_pos,
+            "step output must come before step name"
+        );
+    }
+
+    #[test]
+    fn context_prefix_empty_when_no_relevant_keys() {
+        let ctx = Context::new();
+        let prefix = build_context_prefix(&ctx);
+        assert!(prefix.is_empty());
+    }
+
+    #[test]
+    fn console_interviewer_implements_interviewer_trait() {
+        use attractor::interviewer::{ConsoleInterviewer, Interviewer};
+        fn assert_is_interviewer<T: Interviewer>() {}
+        assert_is_interviewer::<ConsoleInterviewer>();
     }
 
     // ── print_event ────────────────────────────────────────────────────────

@@ -1695,9 +1695,10 @@ digraph loop_test {
 "#;
         // Backend: Fail for every node (including `task`), which keeps the
         // goal gate unsatisfied on every iteration.
-        let mock = Arc::new(MockCodergenBackend::new().with_default(
-            crate::state::context::Outcome::fail("always fail"),
-        ));
+        let mock = Arc::new(
+            MockCodergenBackend::new()
+                .with_default(crate::state::context::Outcome::fail("always fail")),
+        );
         let (runner, _rx) = make_runner(mock.clone());
 
         // Limit to 5 iterations so the test completes in < 1 second.

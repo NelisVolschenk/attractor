@@ -113,23 +113,29 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64",
  "chrono",
  "clap",
  "coding-agent-loop",
  "futures",
+ "globset",
  "indexmap",
  "nom",
  "proptest",
+ "rand",
  "regex",
+ "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror",
  "tokio",
+ "tokio-stream",
  "tokio-util",
  "tracing",
  "tracing-subscriber",
- "unified-llm",
+ "unified-llm 0.1.0",
  "uuid",
 ]
 
@@ -288,7 +294,6 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 [[package]]
 name = "coding-agent-loop"
 version = "0.1.0"
-source = "git+https://github.com/bkrabach/coding-agent-loop.git#0143713597b217787e798ee123c930fff4afe5e1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -302,7 +307,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
- "unified-llm",
+ "unified-llm 0.1.0 (git+https://github.com/bkrabach/unified-llm.git)",
  "uuid",
 ]
 
@@ -1781,6 +1786,7 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]
@@ -1931,6 +1937,26 @@ name = "unicode-xid"
 version = "0.2.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ebc1c04c71510c7f702b52b7c350734c9ff1295c464a03335b00bb84fc54f853"
+
+[[package]]
+name = "unified-llm"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64",
+ "chrono",
+ "futures",
+ "jsonschema",
+ "rand",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-stream",
+ "tracing",
+ "uuid",
+]
 
 [[package]]
 name = "unified-llm"
