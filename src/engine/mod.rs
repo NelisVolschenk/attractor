@@ -449,6 +449,13 @@ impl PipelineRunner {
                 outcome.status
             ));
 
+            // ATR-BUG-005: Track the most recent codergen (LLM) node so human
+            // gates can display the correct previous LLM response even when
+            // tool/conditional nodes intervene between the LLM and the gate.
+            if is_codergen_node(&node) {
+                context.set("_last_codergen_stage", Value::Str(current_node_id.clone()));
+            }
+
             // ----------------------------------------------------------------
             // Step 4: Apply context updates
             // ----------------------------------------------------------------
@@ -759,6 +766,26 @@ fn accumulate_human_history(
     }
 
     context.set("_human_interactions", Value::Str(updated));
+}
+
+// ---------------------------------------------------------------------------
+// Helper: is_codergen_node (ATR-BUG-005)
+// ---------------------------------------------------------------------------
+
+/// Check if a node resolves to the codergen handler type.
+///
+/// A node is "codergen" if its explicit `node_type` is `"codergen"`, **or**
+/// its shape maps to `"codergen"` via [`shape_to_handler_type`].
+///
+/// We always check shape because the [`HandlerRegistry`] falls through to
+/// shape-based resolution when `node_type` is set but not registered.
+/// Without this, a node with `node_type="llm_task"` (unregistered) and
+/// `shape="box"` would run via CodergenHandler but not be tracked.
+fn is_codergen_node(node: &crate::graph::Node) -> bool {
+    if node.node_type == "codergen" {
+        return true;
+    }
+    crate::handler::shape_to_handler_type(&node.shape) == Some("codergen")
 }
 
 // ---------------------------------------------------------------------------
@@ -2044,5 +2071,72 @@ digraph loop_test {
         let config = RunConfig::new(dir.path()).with_max_iterations(1000);
         let result = runner.run(&dot, config).await.unwrap();
         assert_eq!(result.status, StageStatus::Success);
+    }
+
+    // ---------------------------------------------------------------------------
+    // ATR-BUG-005: _last_codergen_stage tracking
+    // ---------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn last_codergen_stage_tracks_codergen_nodes() {
+        // ATR-BUG-005: Pipeline with codergen → tool → human_gate.
+        // Verify _last_codergen_stage equals the codergen node ID even
+        // though the tool node ran after it.
+        let dir = tempfile::tempdir().unwrap();
+        let mock = Arc::new(MockCodergenBackend::new());
+
+        let dot = r#"
+digraph test {
+    graph [goal="codergen tracking test"]
+    start     [shape=Mdiamond]
+    exit      [shape=Msquare]
+    llm_node  [prompt="do LLM work"]
+    tool_node [shape=parallelogram, tool_command="echo done"]
+    start -> llm_node -> tool_node -> exit
+}
+"#;
+        let (runner, _rx) = make_runner(mock.clone());
+        let result = runner.run(dot, RunConfig::new(dir.path())).await.unwrap();
+
+        assert_eq!(result.status, StageStatus::Success);
+        // _last_codergen_stage must point to the codergen node, NOT the tool node.
+        assert_eq!(
+            result.context.get_string("_last_codergen_stage"),
+            "llm_node",
+            "_last_codergen_stage must equal the codergen node ID, \
+             not the tool node that ran after it"
+        );
+    }
+
+    #[tokio::test]
+    async fn last_codergen_stage_not_overwritten_by_tool_node() {
+        // ATR-BUG-005: Pipeline with codergen_a → tool → codergen_b → tool.
+        // Verify _last_codergen_stage equals codergen_b (the most recent LLM node).
+        let dir = tempfile::tempdir().unwrap();
+        let mock = Arc::new(MockCodergenBackend::new());
+
+        let dot = r#"
+digraph test {
+    graph [goal="codergen ordering test"]
+    start      [shape=Mdiamond]
+    exit       [shape=Msquare]
+    codergen_a [prompt="first LLM"]
+    tool_1     [shape=parallelogram, tool_command="echo mid"]
+    codergen_b [prompt="second LLM"]
+    tool_2     [shape=parallelogram, tool_command="echo end"]
+    start -> codergen_a -> tool_1 -> codergen_b -> tool_2 -> exit
+}
+"#;
+        let (runner, _rx) = make_runner(mock.clone());
+        let result = runner.run(dot, RunConfig::new(dir.path())).await.unwrap();
+
+        assert_eq!(result.status, StageStatus::Success);
+        // Must be the LAST codergen node, not the first or the tool.
+        assert_eq!(
+            result.context.get_string("_last_codergen_stage"),
+            "codergen_b",
+            "_last_codergen_stage must equal the most recent codergen node (codergen_b), \
+             not codergen_a or tool_2"
+        );
     }
 }

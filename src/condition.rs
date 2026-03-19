@@ -2,11 +2,12 @@
 //!
 //! The condition language is a minimal boolean DSL for edge guards:
 //! ```text
-//! ConditionExpr  ::= Clause ( '&&' Clause )*
+//! ConditionExpr  ::= Clause ( Separator Clause )*
+//! Separator      ::= '&&' | ','
 //! Clause         ::= Key Operator Literal
 //! Key            ::= 'outcome' | 'preferred_label' | 'context.' Path
 //! Operator       ::= '=' | '!='
-//! Literal        ::= anything up to '&&' or end-of-string
+//! Literal        ::= anything up to '&&', ',' or end-of-string
 //! ```
 //!
 //! ## Public API
@@ -72,11 +73,14 @@ pub fn parse_condition(expr: &str) -> Result<ConditionExpr, ParseError> {
         return Ok(ConditionExpr { clauses: vec![] });
     }
 
-    // Split on `&&` — handles `&&` with surrounding whitespace.
-    let raw_clauses: Vec<&str> = expr.split("&&").collect();
+    // Split on `&&` or `,` as clause separators.
+    // Commas are accepted so DOT files can use either syntax for compound
+    // conditions.  Note: this means literal values containing commas are
+    // no longer representable in condition expressions.
+    let raw_clauses = split_clauses(expr);
     let mut clauses = Vec::with_capacity(raw_clauses.len());
 
-    for raw in raw_clauses {
+    for raw in &raw_clauses {
         let raw = raw.trim();
         if raw.is_empty() {
             return Err(ParseError::ConditionSyntax(format!(
@@ -90,6 +94,21 @@ pub fn parse_condition(expr: &str) -> Result<ConditionExpr, ParseError> {
     }
 
     Ok(ConditionExpr { clauses })
+}
+
+/// Split a condition expression on `&&` or `,` separators.
+///
+/// Both delimiters carry the same semantics (AND). The implementation splits
+/// on `&&` first, then on `,` within each piece.  Because all clauses are
+/// unconditionally ANDed, the split order does not affect evaluation.
+fn split_clauses(expr: &str) -> Vec<String> {
+    let mut result = Vec::new();
+    for piece in expr.split("&&") {
+        for sub in piece.split(',') {
+            result.push(sub.to_string());
+        }
+    }
+    result
 }
 
 fn parse_clause(raw: &str) -> Result<Clause, String> {
@@ -353,6 +372,150 @@ mod tests {
         assert!(
             !evaluate_condition(
                 "outcome=success && context.tests_passed=true",
+                "success",
+                "",
+                &c
+            )
+            .unwrap()
+        );
+    }
+
+    // --- comma as clause separator (DOT-BUG-001) ---
+
+    #[test]
+    fn parse_comma_separated_two_clauses() {
+        // Commas should be accepted as clause separators (same as &&).
+        let c = parse_condition(
+            "context.tool.output!=all_complete,context.tool.output!=no_tasks_found",
+        )
+        .unwrap();
+        assert_eq!(c.clauses.len(), 2);
+        assert_eq!(
+            c.clauses[0].key,
+            ConditionKey::Context("tool.output".to_string())
+        );
+        assert_eq!(c.clauses[0].op, ConditionOp::NotEq);
+        assert_eq!(c.clauses[0].value, "all_complete");
+        assert_eq!(
+            c.clauses[1].key,
+            ConditionKey::Context("tool.output".to_string())
+        );
+        assert_eq!(c.clauses[1].op, ConditionOp::NotEq);
+        assert_eq!(c.clauses[1].value, "no_tasks_found");
+    }
+
+    #[test]
+    fn parse_comma_with_spaces() {
+        let c =
+            parse_condition("outcome=success , context.done=true").unwrap();
+        assert_eq!(c.clauses.len(), 2);
+        assert_eq!(c.clauses[0].key, ConditionKey::Outcome);
+        assert_eq!(c.clauses[0].value, "success");
+        assert_eq!(
+            c.clauses[1].key,
+            ConditionKey::Context("done".to_string())
+        );
+        assert_eq!(c.clauses[1].value, "true");
+    }
+
+    #[test]
+    fn parse_mixed_comma_and_ampersand() {
+        // Mixed separators should work: comma + && in the same expression.
+        let c = parse_condition(
+            "outcome=success,context.a=1 && context.b=2",
+        )
+        .unwrap();
+        assert_eq!(c.clauses.len(), 3);
+        assert_eq!(c.clauses[0].value, "success");
+        assert_eq!(c.clauses[1].value, "1");
+        assert_eq!(c.clauses[2].value, "2");
+    }
+
+    #[test]
+    fn parse_trailing_comma_is_error() {
+        assert!(parse_condition("outcome=success,").is_err());
+    }
+
+    #[test]
+    fn parse_leading_comma_is_error() {
+        assert!(parse_condition(",outcome=success").is_err());
+    }
+
+    #[test]
+    fn eval_comma_separated_both_pass() {
+        let c = ctx(&[
+            ("tool.output", json!("running")),
+        ]);
+        // Both != clauses should pass when value is "running" (bare key).
+        assert!(
+            evaluate_condition(
+                "context.tool.output!=all_complete,context.tool.output!=no_tasks_found",
+                "success",
+                "",
+                &c
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn eval_comma_separated_prefixed_key() {
+        // Verify with the canonical prefixed key form (context.tool.output stored
+        // as "context.tool.output" in the context map).
+        let c = ctx(&[
+            ("context.tool.output", json!("all_complete")),
+        ]);
+        // First != clause fails because value IS "all_complete".
+        assert!(
+            !evaluate_condition(
+                "context.tool.output!=all_complete,context.tool.output!=no_tasks_found",
+                "success",
+                "",
+                &c
+            )
+            .unwrap()
+        );
+        // Now with a non-matching value — both clauses pass.
+        let c2 = ctx(&[
+            ("context.tool.output", json!("running")),
+        ]);
+        assert!(
+            evaluate_condition(
+                "context.tool.output!=all_complete,context.tool.output!=no_tasks_found",
+                "success",
+                "",
+                &c2
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn eval_comma_separated_first_fails() {
+        let c = ctx(&[
+            ("tool.output", json!("all_complete")),
+        ]);
+        // First != clause fails when value IS "all_complete".
+        assert!(
+            !evaluate_condition(
+                "context.tool.output!=all_complete,context.tool.output!=no_tasks_found",
+                "success",
+                "",
+                &c
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn eval_comma_separated_second_fails() {
+        let c = ctx(&[
+            ("tool.output", json!("no_tasks_found")),
+        ]);
+        // Second != clause fails when value IS "no_tasks_found".
+        assert!(
+            !evaluate_condition(
+                "context.tool.output!=all_complete,context.tool.output!=no_tasks_found",
                 "success",
                 "",
                 &c

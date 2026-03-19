@@ -64,10 +64,17 @@ impl Handler for WaitForHumanHandler {
             if let Some(prev) = context.get("human.gate.response") {
                 m.insert("previous_response".to_string(), prev.to_string_repr());
             }
-            // Add response_md_path so the interviewer can read the full response
-            // from disk rather than using the truncated last_response value.
-            if let Some(last_stage) = context.get("last_stage") {
-                let stage_name = last_stage.to_string_repr();
+            // ATR-BUG-005: Prefer _last_codergen_stage (set by the engine for the
+            // most recent codergen/LLM node) over last_stage so that tool/conditional
+            // nodes between the LLM and the human gate don't hide the LLM response.
+            let codergen_stage = context
+                .get("_last_codergen_stage")
+                .or_else(|| context.get("last_stage"));
+            if let Some(stage_val) = codergen_stage {
+                let stage_name = stage_val.to_string_repr();
+                // Expose the resolved codergen node ID so the UI can fetch its
+                // response directly (instead of using the last completed node).
+                m.insert("last_codergen_node".to_string(), stage_name.clone());
                 let response_md = logs_root.join(&stage_name).join("response.md");
                 if response_md.exists() {
                     m.insert(
@@ -935,6 +942,76 @@ mod tests {
                 .metadata
                 .contains_key("response_md_path"),
             "question metadata must NOT contain response_md_path when file does not exist"
+        );
+    }
+
+    // -- ATR-BUG-005: _last_codergen_stage preference --
+
+    #[tokio::test]
+    async fn wait_human_uses_last_codergen_stage_for_response_md_path() {
+        // ATR-BUG-005: When _last_codergen_stage is set and points to a node
+        // with response.md, the metadata should use that path even when
+        // last_stage points to a different node (e.g. a tool node) that has
+        // no response.md.
+        let dir = tempfile::tempdir().unwrap();
+        let (g, node) = make_freeform_graph("brainstorm");
+
+        // Create response.md for the LLM node but NOT for the tool node.
+        let llm_dir = dir.path().join("llm_node");
+        std::fs::create_dir_all(&llm_dir).unwrap();
+        std::fs::write(llm_dir.join("response.md"), "LLM generated output").unwrap();
+        // tool_node directory intentionally does NOT have response.md.
+
+        let answer = Answer {
+            value: AnswerValue::Selected("user response".to_string()),
+            selected_option: None,
+            text: "user response".to_string(),
+        };
+        let queue_iv = QueueInterviewer::new(vec![answer]);
+        let recording_iv = Arc::new(RecordingInterviewer::new(queue_iv));
+        let handler = WaitForHumanHandler::new(recording_iv.clone());
+
+        let ctx = Context::new();
+        // _last_codergen_stage points to the LLM node (has response.md).
+        ctx.set(
+            "_last_codergen_stage",
+            Value::Str("llm_node".to_string()),
+        );
+        // last_stage points to the tool node (no response.md).
+        ctx.set("last_stage", Value::Str("tool_node".to_string()));
+
+        let _ = handler.execute(&node, &ctx, &g, dir.path()).await.unwrap();
+
+        let recordings = recording_iv.recordings();
+        assert_eq!(recordings.len(), 1);
+
+        // response_md_path must point to llm_node's response.md, NOT tool_node's.
+        assert!(
+            recordings[0]
+                .question
+                .metadata
+                .contains_key("response_md_path"),
+            "question metadata must contain response_md_path from _last_codergen_stage"
+        );
+        let path_val = recordings[0]
+            .question
+            .metadata
+            .get("response_md_path")
+            .unwrap();
+        assert!(
+            path_val.ends_with("llm_node/response.md"),
+            "response_md_path must point to llm_node/response.md, got: {path_val}"
+        );
+
+        // last_codergen_node must be exposed in metadata.
+        assert_eq!(
+            recordings[0]
+                .question
+                .metadata
+                .get("last_codergen_node")
+                .unwrap(),
+            "llm_node",
+            "last_codergen_node metadata must equal _last_codergen_stage"
         );
     }
 }

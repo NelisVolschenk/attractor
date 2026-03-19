@@ -108,7 +108,7 @@ impl Handler for CodergenHandler {
         let response_text: String;
         if let Some(backend) = &self.backend {
             match backend.run(node, &augmented_prompt, context).await {
-                Ok(CodergenResult::Outcome(outcome)) => {
+                Ok(CodergenResult::Outcome(mut outcome)) => {
                     // Backend returned a full outcome.
                     // NLSpec §11.6: response.md must be written unconditionally.
                     let response_content = if !outcome.notes.is_empty() {
@@ -118,6 +118,14 @@ impl Handler for CodergenHandler {
                     };
                     fs::write(stage_dir.join("response.md"), &response_content).await?;
                     write_status(&stage_dir, &outcome).await?;
+                    // ATR-BUG-005: Ensure last_stage and last_response are set
+                    // even when the backend returns a full Outcome, so downstream
+                    // human gates can find the correct LLM response.
+                    outcome.context_updates.entry("last_stage".to_string())
+                        .or_insert_with(|| Value::Str(node.id.clone()));
+                    let truncated: String = response_content.chars().take(200).collect();
+                    outcome.context_updates.entry("last_response".to_string())
+                        .or_insert_with(|| Value::Str(truncated));
                     return Ok(outcome);
                 }
                 Ok(CodergenResult::Text(text)) => {

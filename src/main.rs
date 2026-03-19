@@ -157,18 +157,24 @@ impl CodergenBackend for LlmCodergenBackend {
         let env = Box::new(LocalExecutionEnvironment::new(&working_dir));
 
         // 5. Configure the session with reasonable limits for a pipeline node.
-        let mut config = SessionConfig::default();
-        config.max_tool_rounds_per_input = 50; // prevent runaway tool loops
-
+        //
         // Only override reasoning_effort when the DOT author explicitly set a
         // non-default value.  The parser defaults every node to "high", so
         // forwarding it unconditionally would inject reasoning_effort into
         // requests for models that don't support it (e.g. gpt-4o, gemini).
         // SessionConfig::default() leaves it as None, which is correct for
         // all models.  Only explicit "low"/"medium" overrides take effect.
-        if !node.reasoning_effort.is_empty() && node.reasoning_effort != "high" {
-            config.reasoning_effort = Some(node.reasoning_effort.clone());
-        }
+        let config = SessionConfig {
+            max_tool_rounds_per_input: 50, // prevent runaway tool loops
+            reasoning_effort: if !node.reasoning_effort.is_empty()
+                && node.reasoning_effort != "high"
+            {
+                Some(node.reasoning_effort.clone())
+            } else {
+                None
+            },
+            ..Default::default()
+        };
 
         // 6. Create a fresh Session and run the agentic loop.
         let mut session = Session::new(config, profile, env, self.client.clone());
