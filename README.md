@@ -5,22 +5,26 @@ A DOT-based pipeline runner for multi-stage AI workflows.
 [![CI](https://github.com/bkrabach/attractor/actions/workflows/ci.yaml/badge.svg)](https://github.com/bkrabach/attractor/actions)
 [![MIT license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
+## Overview
+
+Attractor is a Rust library that parses standard Graphviz DOT digraphs into executable AI pipelines. It provides a full lifecycle — parse, transform, validate, execute — with built-in support for branching, human-in-the-loop gates, parallel execution, retry logic, and checkpointing. The engine dispatches each node to shape-based handlers, making it straightforward to plug in LLM backends, tools, or custom logic.
+
 ## Features
 
-- **DOT parser** -- Parse standard Graphviz DOT digraphs into a typed graph model with node attributes, edge conditions, and graph-level configuration
-- **Validation** -- Built-in lint rules check for missing start/exit nodes, unreachable nodes, ambiguous edges, and structural issues
-- **Execution engine** -- Walk the graph from start to exit, dispatching each node to the appropriate handler
-- **Handler system** -- Shape-based handler resolution with a registry for custom handlers
-- **Condition expressions** -- Edge conditions like `outcome=success` or `outcome!=fail` control branching
-- **Human-in-the-loop** -- `wait.human` nodes pause execution and present choices to a pluggable `Interviewer`
-- **Parallel execution** -- `component` nodes fan out to parallel branches; `tripleoctagon` nodes fan in and join
-- **Retry** -- Per-node `max_retries` with configurable backoff; graph-level `retry_target` for goal gate failures
-- **Goal gates** -- Nodes marked `goal_gate=true` must succeed before the pipeline can exit
-- **Checkpointing** -- Automatic checkpoint after each node; resume interrupted pipelines from where they stopped
-- **Model stylesheet** -- CSS-like rules that assign models and parameters to nodes by class or ID
-- **Variable expansion** -- `$goal` in prompts is replaced with the graph-level goal attribute
-- **Pipeline events** -- Broadcast channel for real-time observation of node execution, retries, and completion
-- **AST transforms** -- Transform pipeline to expand variables and apply stylesheets before execution
+- **DOT parser** — Parse standard Graphviz DOT digraphs into a typed graph model with node attributes, edge conditions, and graph-level configuration
+- **Validation** — Built-in lint rules check for missing start/exit nodes, unreachable nodes, ambiguous edges, and structural issues
+- **Execution engine** — Walk the graph from start to exit, dispatching each node to the appropriate handler
+- **Handler system** — Shape-based handler resolution with a registry for custom handlers
+- **Condition expressions** — Edge conditions like `outcome=success` or `outcome!=fail` control branching
+- **Human-in-the-loop** — `wait.human` nodes pause execution and present choices to a pluggable `Interviewer`
+- **Parallel execution** — `component` nodes fan out to parallel branches; `tripleoctagon` nodes fan in and join
+- **Retry with backoff** — Per-node `max_retries` with configurable backoff; graph-level `retry_target` for goal gate failures
+- **Goal gates** — Nodes marked `goal_gate=true` must succeed before the pipeline can exit
+- **Checkpointing** — Automatic checkpoint after each node; resume interrupted pipelines from where they stopped
+- **Model stylesheet** — CSS-like rules that assign models and parameters to nodes by class or ID
+- **Variable expansion** — `$goal` in prompts is replaced with the graph-level goal attribute
+- **Pipeline events** — Broadcast channel for real-time observation of node execution, retries, and completion
+- **AST transforms** — Transform pipeline to expand variables and apply stylesheets before execution
 
 ## Quick Start
 
@@ -66,53 +70,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-By default the runner operates in **simulation mode** -- codergen nodes return synthetic responses without calling an LLM. To connect a real backend, see [Custom Handler / CodergenBackend](#custom-handler--codergenbackend) below.
+By default the runner operates in **simulation mode** — codergen nodes return synthetic responses without calling an LLM. To connect a real backend, see [Custom Handler / CodergenBackend](#custom-handler--codergenbackend) below.
 
-## DOT Pipeline Example
+## API
 
-A complete pipeline with branching, retry, and a human gate:
-
-```dot
-digraph FeaturePipeline {
-    graph [goal="Implement and validate a feature"]
-    rankdir=LR
-    node [shape=box, timeout="900s"]
-
-    // Lifecycle nodes
-    start [shape=Mdiamond, label="Start"]
-    exit  [shape=Msquare, label="Exit"]
-
-    // Work stages
-    plan      [label="Plan", prompt="Plan the implementation for: $goal"]
-    implement [label="Implement", prompt="Implement the plan"]
-    test      [label="Test", prompt="Run the test suite", max_retries=2]
-
-    // Decision gate
-    gate [shape=diamond, label="Tests passing?"]
-
-    // Human review
-    review [shape=hexagon, label="Review Changes", type="wait.human"]
-
-    // Flow
-    start -> plan -> implement -> test -> gate
-    gate -> review    [label="Yes", condition="outcome=success"]
-    gate -> implement [label="No",  condition="outcome!=success"]
-    review -> exit    [label="Approve"]
-    review -> implement [label="Revise"]
-}
-```
-
-Run it:
-
-```rust
-use attractor::{PipelineRunner, RunConfig};
-
-let dot = include_str!("pipeline.dot");
-let (runner, _events) = PipelineRunner::builder().build();
-let result = runner.run(dot, RunConfig::new("./logs")).await?;
-```
-
-## Handler Types
+### Handler Types
 
 Each node shape maps to a handler type. The engine resolves handlers in priority order: explicit `type` attribute, then shape-based lookup, then the default handler.
 
@@ -134,16 +96,16 @@ Override shape-based resolution with an explicit `type` attribute:
 my_node [shape=box, type="wait.human", label="Custom Gate"]
 ```
 
-## Human-in-the-Loop
+### Human-in-the-Loop
 
 Nodes with `shape=hexagon` (or `type="wait.human"`) pause the pipeline and present the outgoing edge labels as choices to an `Interviewer`. The pipeline resumes along the chosen edge.
 
 Built-in interviewers:
 
-- `AutoApproveInterviewer` -- Always picks the first option (default; useful for testing)
-- `CallbackInterviewer` -- Delegates to an async callback function
-- `QueueInterviewer` -- Pre-loaded answer queue for deterministic testing
-- `RecordingInterviewer` -- Wraps another interviewer and records all Q&A pairs
+- `AutoApproveInterviewer` — Always picks the first option (default; useful for testing)
+- `CallbackInterviewer` — Delegates to an async callback function
+- `QueueInterviewer` — Pre-loaded answer queue for deterministic testing
+- `RecordingInterviewer` — Wraps another interviewer and records all Q&A pairs
 
 ```rust
 use std::sync::Arc;
@@ -170,7 +132,7 @@ let (runner, _events) = PipelineRunner::builder()
 let result = runner.run(dot, RunConfig::new("./logs")).await?;
 ```
 
-## Custom Handler / CodergenBackend
+### Custom Handler / CodergenBackend
 
 The `CodergenBackend` trait is the integration point for connecting an LLM (or a `coding-agent-loop` Session) to the pipeline engine. Implement it to control how `shape=box` nodes are executed.
 
@@ -210,11 +172,9 @@ let (runner, _events) = PipelineRunner::builder()
 
 Return `CodergenResult::Outcome(outcome)` to directly control the node's success/fail/retry status instead of returning plain text.
 
-## Condition Expressions
+### Condition Expressions
 
 Edge conditions control branching at `diamond` (conditional) nodes and are evaluated against the pipeline context.
-
-Supported operators:
 
 | Expression | Meaning |
 |---|---|
@@ -230,7 +190,7 @@ gate -> retry_path [condition="outcome!=success"]
 
 Edges are evaluated in declaration order. The first matching edge is taken. If no condition matches and there is an unconditional edge, it serves as the default.
 
-## Model Stylesheet
+### Model Stylesheet
 
 A CSS-like stylesheet assigns models and parameters to nodes by class or ID, keeping prompt logic separate from model selection.
 
@@ -262,7 +222,7 @@ digraph {
 
 Nodes in the "Planning" subgraph receive class `planning`; nodes in "Coding" receive class `coding`. The stylesheet is applied as an AST transform before execution.
 
-## Checkpoint and Resume
+### Checkpoint and Resume
 
 The engine writes a checkpoint after each node completes. If a pipeline is interrupted, resume from where it left off:
 
@@ -281,15 +241,7 @@ let result = runner.resume(dot, config).await?;
 println!("Resumed pipeline completed: {:?}", result.status);
 ```
 
-Checkpoints are stored as JSON in the `logs_root` directory and contain:
-
-- Current node ID
-- Completed node list
-- Per-node retry counts
-- Full context snapshot
-- Execution logs
-
-## Pipeline Events
+### Pipeline Events
 
 Subscribe to a broadcast channel to observe pipeline execution in real time:
 
@@ -316,7 +268,7 @@ tokio::spawn(async move {
 });
 ```
 
-## Architecture
+### Architecture
 
 ```
 DOT source
@@ -354,28 +306,19 @@ DOT source
           ManagerLoopHandler
 ```
 
-The engine lifecycle for each `run()` call:
+## Origin
 
-```
-PARSE -> TRANSFORM -> VALIDATE -> INITIALIZE -> EXECUTE -> FINALIZE
-```
+This project was built from the [attractor](https://github.com/strongdm/attractor) natural language specification (NLSpec) by [strongDM](https://github.com/strongdm). The NLSpec defines the pipeline engine's architecture, execution model, and handler system in a language-agnostic format.
 
-During execution, the engine walks the graph node by node:
+## Ecosystem
 
-1. Resolve the handler for the current node (type attribute > shape > default)
-2. Execute the handler, producing an `Outcome` (success/fail/retry + context updates)
-3. Write checkpoint
-4. Select the next edge based on the outcome and edge conditions
-5. Repeat until an exit node is reached or an error occurs
-
-## Dependencies
-
-- [coding-agent-loop](https://github.com/bkrabach/coding-agent-loop) -- Autonomous coding agent loop
-- [unified-llm](https://github.com/bkrabach/unified-llm) -- LLM client library
-
-## NLSpec
-
-Implemented from the [Attractor NLSpec](https://github.com/bkrabach/attractor).
+| Project | Description |
+|---------|-------------|
+| [attractor](https://github.com/bkrabach/attractor) | DOT-based pipeline engine |
+| [attractor-server](https://github.com/bkrabach/attractor-server) | HTTP API server |
+| [attractor-ui](https://github.com/bkrabach/attractor-ui) | Web frontend |
+| [unified-llm](https://github.com/bkrabach/unified-llm) | Multi-provider LLM client |
+| [coding-agent-loop](https://github.com/bkrabach/coding-agent-loop) | Agentic tool loop |
 
 ## License
 
