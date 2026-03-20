@@ -311,14 +311,14 @@ mod tests {
 
     #[test]
     fn parse_float_basic() {
-        let (_, v) = parse_float("3.14").unwrap();
-        assert_eq!(v, Value::Float(3.14));
+        let (_, v) = parse_float("3.15").unwrap();
+        assert_eq!(v, Value::Float(3.15));
     }
 
     #[test]
     fn parse_float_negative() {
-        let (_, v) = parse_float("-3.14").unwrap();
-        assert_eq!(v, Value::Float(-3.14));
+        let (_, v) = parse_float("-3.15").unwrap();
+        assert_eq!(v, Value::Float(-3.15));
     }
 
     #[test]
